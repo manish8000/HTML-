@@ -83,7 +83,7 @@ PDF_DIR.mkdir(
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
-    "llama-3.3-70b-versatile"
+    "openai/gpt-oss-120b"
 )
 
 REQUEST_TIMEOUT = int(
