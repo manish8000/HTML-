@@ -14,6 +14,7 @@ import hashlib
 import logging
 import sqlite3
 import threading
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -7368,12 +7369,18 @@ def build_application():
     # ========================================================
 
     application.add_handler(
-        CallbackQueryHandler(
-            quiz_callback_handler,
-            pattern=r"^(ans|stopquiz):"
-        )
+    CallbackQueryHandler(
+        answer_callback,
+        pattern=r"^ans:"
     )
+)
 
+application.add_handler(
+    CallbackQueryHandler(
+        stop_quiz_callback,
+        pattern=r"^stopquiz:"
+    )
+)
     # ========================================================
     # TEXT INPUT
     #
@@ -7410,20 +7417,7 @@ def build_application():
 # HEALTH SERVER
 # ============================================================
 
-def run_health_server():
 
-    try:
-        app.run(
-            host="0.0.0.0",
-            port=PORT,
-            debug=False,
-            use_reloader=False
-        )
-
-    except Exception:
-        logger.exception(
-            "Health server stopped."
-        )
         # ============================================================
 # MAIN
 # ============================================================
