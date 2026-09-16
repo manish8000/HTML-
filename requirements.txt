@@ -1,2 +1,6 @@
-python-telegram-bot
-pdfplumber
+python-telegram-bot==22.8
+groq
+requests
+beautifulsoup4
+flask
+gunicorn
