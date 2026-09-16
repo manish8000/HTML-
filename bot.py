@@ -3361,11 +3361,10 @@ async def quiz_command(
 
     user = update.effective_user
 
-    ensure_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+ ensure_user(user)
+
+
+
 
     args = context.args
 
@@ -3436,11 +3435,11 @@ async def quizid_command(
 
     user = update.effective_user
 
-    ensure_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+   
+    ensure_user(user)
+
+
+    
 
     if not context.args:
 
@@ -3727,11 +3726,11 @@ async def start_command(
 
     user = update.effective_user
 
-    ensure_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+    
+ensure_user(user)
+
+
+
 
     admin_text = ""
 
@@ -3763,11 +3762,11 @@ async def stats_command(
 
     user = update.effective_user
 
-    ensure_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+    ensure_user(user)
+
+
+
+    
 
     stats = get_stats(
         user.id
@@ -4257,11 +4256,11 @@ async def newquiz_command(
 
     user = update.effective_user
 
-    ensure_user(
-        user.id,
-        user.username,
-        user.first_name
-    )
+    
+ensure_user(user)
+
+
+
 
     # पुराने quiz creation state को साफ करें
     QUIZ_CREATE.pop(
@@ -7033,11 +7032,11 @@ async def status_command(update, context):
     user = update.effective_user
 
     if user:
-        ensure_user(
-            user.id,
-            user.username,
-            user.first_name
-        )
+        
+   ensure_user(user)
+
+
+
 
     conn = db()
 
