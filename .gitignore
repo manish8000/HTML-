@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+quizbot.db
+quizbot.db-shm
+quizbot.db-wal
+data/
