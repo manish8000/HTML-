@@ -1,497 +1,1013 @@
 import os
 import re
 import json
+import html
+import time
 import random
+import hashlib
+import sqlite3
+import logging
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import pdfplumber
+from pathlib import Path
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import requests
+from bs4 import BeautifulSoup
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-TOKEN = os.environ.get("BOT_TOKEN")
 
-# Koyeb Health Check Web Server (Port 8000 पर 200 OK भेजेगा)
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"OK - Bot is Alive")
+# =========================================================
+# CONFIG
+# =========================================================
 
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-def run_health_server():
-    port = int(os.environ.get("PORT", 8000))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+# Telegram channel username or ID
+# Example:
+# CHANNEL_ID=-1001234567890
+CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 
-user_asked_history = {}
+DB_PATH = os.getenv("DB_PATH", "quizbot.db")
 
-# 150 प्रश्नों का डेटाबेस
-EXAM_DATABASE = {
-    "cet": {
-        "name": "Rajasthan CET (Full Paper - 150 Qs)",
-        "total_paper_questions": 150,
-        "syllabus_quota": {
-            "rajasthan_gk": 50,
-            "india_gk_science": 35,
-            "reasoning_maths": 25,
-            "hindi": 15,
-            "english": 15,
-            "computer": 10
-        },
-        "sample_bank": {
-            "rajasthan_gk": [
-                ("राजस्थान का राज्य वृक्ष कौन सा है?", ["खेजड़ी", "रोहिड़ा", "नीम", "बरगद"], 0),
-                ("हवामहल का निर्माण किसने करवाया था?", ["सवाई प्रताप सिंह", "सवाई जयसिंह", "राजा मानसिंह", "माधो सिंह"], 0),
-                ("कालीबंगा सभ्यता किस जिले में स्थित है?", ["हनुमानगढ़", "बीकानेर", "चूरू", "सीकर"], 0),
-                ("राजस्थान में 1857 की क्रांति का आरंभ कहाँ से हुआ था?", ["नसीराबाद", "एरिनपुरा", "नीमच", "कोटा"], 0),
-                ("पिछोला झील राजस्थान के किस शहर में स्थित है?", ["उदयपुर", "जोधपुर", "अजमेर", "जयपुर"], 0)
-            ],
-            "india_gk_science": [
-                ("मानव शरीर की सबसे बड़ी ग्रंथि कौन सी है?", ["यकृत (Liver)", "थायरॉयड", "पीयूष", "अग्न्याशय"], 0),
-                ("कोशिका का 'पावर हाउस' किसे कहा जाता है?", ["माइटोकॉन्ड्रिया", "राइबोसोम", "लाइसोसोम", "केंद्रक"], 0),
-                ("विटामिन C का रासायनिक नाम क्या है?", ["एस्कॉर्बिक एसिड", "रेटिनॉल", "थायमिन", "कैल्सीफेरोल"], 0)
-            ],
-            "reasoning_maths": [
-                ("श्रेणी पूर्ण करें: 2, 4, 8, 16, ___?", ["32", "24", "64", "20"], 0),
-                ("यदि 5 पेनों का मूल्य ₹50 है, तो 8 पेनों का मूल्य क्या होगा?", ["₹80", "₹70", "₹90", "₹60"], 0)
-            ],
-            "hindi": [
-                ("'सूर्योदय' में कौन सी संधि है?", ["गुण स्वर संधि", "दीर्घ स्वर संधि", "वृद्धि स्वर संधि", "यण स्वर संधि"], 0),
-                ("'अंगूठा दिखाना' मुहावरे का सही अर्थ क्या है?", ["साफ मना करना", "मजाक उड़ाना", "धोखा देना", "गुस्सा होना"], 0)
-            ],
-            "english": [
-                ("Choose the synonym of 'ABANDON':", ["Leave", "Adopt", "Keep", "Join"], 0),
-                ("Fill in the blank: She is good _____ English.", ["at", "in", "with", "for"], 0)
-            ],
-            "computer": [
-                ("कंप्यूटर का मस्तिष्क किसे कहा जाता है?", ["CPU", "RAM", "ROM", "Hard Disk"], 0),
-                ("Ctrl + C शॉर्टकट कुंजी का क्या कार्य है?", ["कॉपी करना", "पेस्ट करना", "कट करना", "सेव करना"], 0)
-            ]
-        }
-    },
-    "police": {
-        "name": "Rajasthan Police Constable (Full Paper - 150 Qs)",
-        "total_paper_questions": 150,
-        "syllabus_quota": {
-            "reasoning_computer": 60,
-            "india_gk_current": 35,
-            "women_child_crime": 10,
-            "rajasthan_gk": 45
-        },
-        "sample_bank": {
-            "reasoning_computer": [
-                ("RAM का पूर्ण रूप क्या है?", ["Random Access Memory", "Read Access Memory", "Real Action Memory", "None"], 0),
-                ("विषम शब्द चुनें: गाय, बकरी, शेर, भैंस", ["शेर", "गाय", "बकरी", "भैंस"], 0)
-            ],
-            "india_gk_current": [
-                ("रक्त का सामान्य pH मान कितना होता है?", ["7.4", "6.5", "8.2", "7.0"], 0),
-                ("ध्वनि की गति सर्वाधिक किसमें होती है?", ["ठोस (Solid)", "द्रव (Liquid)", "गैस (Gas)", "निर्वात"], 0)
-            ],
-            "women_child_crime": [
-                ("POCSO एक्ट किस वर्ष लागू किया गया था?", ["2012", "2010", "2015", "2018"], 0),
-                ("बाल विवाह प्रतिषेध अधिनियम कब लागू हुआ?", ["2006", "2005", "2008", "2010"], 0)
-            ],
-            "rajasthan_gk": [
-                ("राजस्थान पुलिस का ध्येय वाक्य क्या है?", ["आमजन में विश्वास, अपराधियों में डर", "सत्यमेव जयते", "वीरभोग्या वसुंधरा", "अहर्निशं सेवामहे"], 0),
-                ("हल्दीघाटी का ऐतिहासिक युद्ध किस वर्ष लड़ा गया?", ["1576 ई.", "1582 ई.", "1527 ई.", "1544 ई."], 0)
-            ]
-        }
-    },
-    "reet": {
-        "name": "REET Level-2 (Full Paper - 150 Qs)",
-        "total_paper_questions": 150,
-        "syllabus_quota": {
-            "cdp": 30,
-            "hindi": 30,
-            "english": 30,
-            "subject_knowledge": 60
-        },
-        "sample_bank": {
-            "cdp": [
-                ("जीन पियाजे के अनुसार संज्ञानात्मक विकास की कितनी अवस्थाएँ हैं?", ["4", "3", "2", "5"], 0),
-                ("क्रिया-प्रसूत अनुबंधन सिद्धांत किसने दिया?", ["बी. एफ. स्किनर", "पावलोव", "थार्नडाइक", "कोहलर"], 0)
-            ],
-            "hindi": [
-                ("संज्ञा के कितने मुख्य भेद होते हैं?", ["3", "5", "4", "2"], 0),
-                ("'पवन' का सही संधि-विच्छेद क्या होगा?", ["पो + अन", "पौ + अन", "प + वन", "पा + वन"], 0)
-            ],
-            "english": [
-                ("Identify the Part of Speech: 'He runs **fast**.'", ["Adverb", "Adjective", "Noun", "Verb"], 0),
-                ("Choose the antonym of 'BRAVE':", ["Coward", "Courageous", "Bold", "Hero"], 0)
-            ],
-            "subject_knowledge": [
-                ("राजस्थान के किस जिले को 'झीलों की नगरी' कहते हैं?", ["उदयपुर", "जयपुर", "जोधपुर", "अजमेर"], 0),
-                ("पौधों में पर्णहरिम में मुख्य तत्व कौन सा होता है?", ["मैग्नीशियम (Mg)", "लोहा (Fe)", "कैल्शियम (Ca)", "फास्फोरस (P)"], 0)
-            ]
-        }
-    }
-}
+PORT = int(os.getenv("PORT", "8080"))
 
-# PDF से सवाल निकालना
-def extract_questions_from_pdf(pdf_path):
-    extracted = []
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            full_text = ""
-            for page in pdf.pages:
-                text = page.extract_text()
-                if text:
-                    full_text += text + "\n"
+DEFAULT_QUIZ_SIZE = 20
 
-        raw_blocks = re.split(r'\n(?=(?:प्रश्न|प्र\.|Q)\s*\d+[\.\:])', full_text)
-        for block in raw_blocks:
-            lines = [l.strip() for l in block.split("\n") if l.strip()]
-            if len(lines) >= 5:
-                q_line = lines[0]
-                opts = lines[1:5]
-                ans = 0
-                if "उत्तर: (B)" in block or "Ans: B" in block or "(ख)" in block: ans = 1
-                elif "उत्तर: (C)" in block or "Ans: C" in block or "(ग)" in block: ans = 2
-                elif "उत्तर: (D)" in block or "Ans: D" in block or "(घ)" in block: ans = 3
-                extracted.append((q_line, opts, ans))
-    except Exception as e:
-        print(f"PDF extraction error: {e}")
-    return extracted
+# Internet sources
+# Add only sources that allow reuse/API access.
+#
+# Format:
+# {
+#     "name": "My Source",
+#     "url": "https://example.com/questions"
+# }
+INTERNET_SOURCES = [
+    # {
+    #     "name": "Example Source",
+    #     "url": "https://example.com/questions"
+    # }
+]
 
-async def auto_sync_channel_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.channel_post
-    if not message or not message.document:
-        return
 
-    if message.document.mime_type == "application/pdf":
-        file_name = message.document.file_name
-        doc_file = await message.document.get_file()
-        local_path = f"temp_{random.randint(100,999)}_{file_name}"
-        await doc_file.download_to_drive(local_path)
+# =========================================================
+# LOGGING
+# =========================================================
 
-        new_qs = extract_questions_from_pdf(local_path)
-        if new_qs:
-            EXAM_DATABASE["cet"]["sample_bank"]["rajasthan_gk"].extend(new_qs)
-            print(f"✅ चैनल से {len(new_qs)} नए सवाल जुड़े!")
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
-        if os.path.exists(local_path):
-            os.remove(local_path)
+logger = logging.getLogger(__name__)
 
-def generate_full_paper_questions(exam_key, chat_id):
-    exam_info = EXAM_DATABASE[exam_key]
-    quota_dict = exam_info["syllabus_quota"]
-    bank = exam_info["sample_bank"]
 
-    if chat_id not in user_asked_history:
-        user_asked_history[chat_id] = set()
+# =========================================================
+# DATABASE
+# =========================================================
 
-    full_questions_list = []
+db_lock = threading.Lock()
 
-    for subject, required_count in quota_dict.items():
-        sub_bank = bank.get(subject, [])
-        created_for_sub = 0
-        while created_for_sub < required_count:
-            base_q = sub_bank[created_for_sub % len(sub_bank)]
-            q_id = f"{exam_key}_{subject}_{created_for_sub+1}"
 
-            opts = list(base_q[1])
-            correct_text = opts[base_q[2]]
-            random.shuffle(opts)
-
-            full_questions_list.append({
-                "id": q_id,
-                "q": base_q[0],
-                "options": opts,
-                "answer": opts.index(correct_text)
-            })
-            created_for_sub += 1
-
-    random.shuffle(full_questions_list)
-    return full_questions_list
-
-# CBT स्लाइडर HTML
-def build_html_file(exam_title, questions_list, file_name):
-    html_code = f"""<!DOCTYPE html>
-<html lang="hi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{exam_title}</title>
-    <style>
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #eef2f6;
-            margin: 0;
-            padding: 12px;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 95vh;
-        }}
-        .quiz-card {{
-            width: 100%;
-            max-width: 680px;
-            background: #ffffff;
-            border-radius: 14px;
-            padding: 22px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.08);
-            box-sizing: border-box;
-        }}
-        .top-bar {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 2px solid #007bff;
-            padding-bottom: 12px;
-            margin-bottom: 18px;
-        }}
-        .top-bar h3 {{ margin: 0; color: #1e293b; font-size: 17px; }}
-        .badge {{ background: #e0e7ff; color: #3730a3; padding: 5px 12px; border-radius: 20px; font-size: 14px; font-weight: bold; }}
-        
-        .q-slide {{ display: none; }}
-        .q-slide.active {{ display: block; animation: fadeIn 0.2s ease-in-out; }}
-        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(3px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-
-        .q-title {{ font-size: 16px; font-weight: 600; margin-bottom: 15px; color: #0f172a; line-height: 1.5; }}
-        .opt-label {{
-            display: flex;
-            align-items: center;
-            background: #f8fafc;
-            border: 1.5px solid #cbd5e1;
-            padding: 12px 15px;
-            margin-bottom: 10px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 15px;
-            transition: all 0.2s;
-        }}
-        .opt-label:hover {{ background: #f1f5f9; border-color: #94a3b8; }}
-        input[type="radio"] {{ margin-right: 12px; transform: scale(1.2); }}
-
-        .nav-controls {{
-            display: flex;
-            justify-content: space-between;
-            gap: 10px;
-            margin-top: 22px;
-            border-top: 1px solid #e2e8f0;
-            padding-top: 15px;
-        }}
-        .btn {{
-            padding: 12px 20px;
-            font-size: 15px;
-            font-weight: 600;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: 0.2s;
-        }}
-        .btn-prev {{ background: #64748b; color: white; }}
-        .btn-prev:disabled {{ background: #cbd5e1; cursor: not-allowed; }}
-        .btn-next {{ background: #007bff; color: white; }}
-        .btn-submit {{ background: #16a34a; color: white; display: none; }}
-        .btn-reset {{ background: #0284c7; color: white; width: 100%; display: none; margin-top: 15px; }}
-
-        .correct {{ background: #dcfce7 !important; border-color: #22c55e !important; color: #15803d; font-weight: bold; }}
-        .wrong {{ background: #fee2e2 !important; border-color: #ef4444 !important; color: #b91c1c; }}
-        #res-box {{
-            display: none;
-            margin-top: 20px;
-            padding: 16px;
-            background: #ecfdf5;
-            border: 1px solid #6ee7b7;
-            border-radius: 8px;
-            text-align: center;
-            font-size: 18px;
-            font-weight: bold;
-            color: #065f46;
-        }}
-    </style>
-</head>
-<body>
-
-<div class="quiz-card">
-    <div class="top-bar">
-        <h3>{exam_title}</h3>
-        <span class="badge" id="progress-badge">Q 1 / {len(questions_list)}</span>
-    </div>
-
-    <form id="quizForm">
-"""
-    for i, item in enumerate(questions_list):
-        active_cls = "active" if i == 0 else ""
-        html_code += f"""
-        <div class="q-slide {active_cls}" id="slide-{i}">
-            <div class="q-title">Q{i+1}. {item['q']}</div>
-        """
-        for opt_idx, opt in enumerate(item['options']):
-            html_code += f"""
-            <label class="opt-label" id="lbl-{i}-{opt_idx}">
-                <input type="radio" name="q{i}" value="{opt_idx}"> {opt}
-            </label>
-            """
-        html_code += "</div>"
-
-    html_code += f"""
-        <div class="nav-controls">
-            <button type="button" class="btn btn-prev" id="prevBtn" onclick="prevSlide()" disabled>⬅️ Previous</button>
-            <button type="button" class="btn btn-next" id="nextBtn" onclick="nextSlide()">Next ➡️</button>
-            <button type="button" class="btn btn-submit" id="submitBtn" onclick="finishTest()">Submit Full Test 🎯</button>
-        </div>
-        <button type="button" class="btn btn-reset" id="resetBtn" onclick="reattempt()">🔄 Re-attempt Full Test</button>
-    </form>
-
-    <div id="res-box"></div>
-</div>
-
-<script>
-    let currentIndex = 0;
-    const totalQuestions = {len(questions_list)};
-    const answerKeys = {json.dumps([q['answer'] for q in questions_list])};
-
-    function updateView() {{
-        for (let i = 0; i < totalQuestions; i++) {{
-            document.getElementById('slide-' + i).classList.remove('active');
-        }}
-        document.getElementById('slide-' + currentIndex).classList.add('active');
-        document.getElementById('progress-badge').innerText = "Q " + (currentIndex + 1) + " / " + totalQuestions;
-        document.getElementById('prevBtn').disabled = (currentIndex === 0);
-
-        if (currentIndex === totalQuestions - 1) {{
-            document.getElementById('nextBtn').style.display = 'none';
-            document.getElementById('submitBtn').style.display = 'block';
-        }} else {{
-            document.getElementById('nextBtn').style.display = 'block';
-            document.getElementById('submitBtn').style.display = 'none';
-        }}
-    }}
-
-    function nextSlide() {{
-        if (currentIndex < totalQuestions - 1) {{
-            currentIndex++;
-            updateView();
-        }}
-    }}
-
-    function prevSlide() {{
-        if (currentIndex > 0) {{
-            currentIndex--;
-            updateView();
-        }}
-    }}
-
-    function finishTest() {{
-        let score = 0;
-        for (let i = 0; i < totalQuestions; i++) {{
-            let radios = document.getElementsByName('q' + i);
-            for (let r of radios) {{ r.disabled = true; }}
-
-            let selected = document.querySelector('input[name="q' + i + '"]:checked');
-            let correctLabel = document.getElementById('lbl-' + i + '-' + answerKeys[i]);
-            if (correctLabel) correctLabel.classList.add('correct');
-
-            if (selected) {{
-                let val = parseInt(selected.value);
-                if (val === answerKeys[i]) {{
-                    score++;
-                }} else {{
-                    let wrongLabel = document.getElementById('lbl-' + i + '-' + val);
-                    if (wrongLabel) wrongLabel.classList.add('wrong');
-                }}
-            }}
-        }}
-
-        document.getElementById('prevBtn').style.display = 'none';
-        document.getElementById('submitBtn').style.display = 'none';
-        document.getElementById('resetBtn').style.display = 'block';
-
-        let resBox = document.getElementById('res-box');
-        resBox.style.display = 'block';
-        resBox.innerHTML = "🎯 टेस्ट समाप्त!<br>कुल स्कोर: " + score + " / " + totalQuestions;
-    }}
-
-    function reattempt() {{
-        document.getElementById('quizForm').reset();
-        for (let i = 0; i < totalQuestions; i++) {{
-            let radios = document.getElementsByName('q' + i);
-            for (let r of radios) {{ r.disabled = false; }}
-            for (let opt = 0; opt < 4; opt++) {{
-                let lbl = document.getElementById('lbl-' + i + '-' + opt);
-                if (lbl) {{
-                    lbl.classList.remove('correct');
-                    lbl.classList.remove('wrong');
-                }}
-            }}
-        }}
-        document.getElementById('res-box').style.display = 'none';
-        document.getElementById('resetBtn').style.display = 'none';
-        currentIndex = 0;
-        document.getElementById('prevBtn').style.display = 'block';
-        updateView();
-    }}
-</script>
-</body>
-</html>"""
-
-    with open(file_name, "w", encoding="utf-8") as f:
-        f.write(html_code)
-    return file_name
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.effective_message.text.lower().strip()
-    chat_id = str(update.effective_chat.id)
-
-    selected_key = None
-    if "cet" in text and "test" in text:
-        selected_key = "cet"
-    elif "police" in text and "test" in text:
-        selected_key = "police"
-    elif "reet" in text and "test" in text:
-        selected_key = "reet"
-
-    if not selected_key:
-        return
-
-    exam_info = EXAM_DATABASE[selected_key]
-    status_msg = await update.effective_message.reply_text(
-        f"⏳ **{exam_info['name']} का फुल CBT टेस्ट तैयार हो रहा है...**"
+def db():
+    return sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False,
+        timeout=30,
     )
 
-    picked_questions = generate_full_paper_questions(selected_key, chat_id)
-    rand_id = random.randint(1000, 9999)
-    file_name = f"{selected_key.upper()}_CBT_Test_{rand_id}.html"
-    file_path = build_html_file(exam_info['name'], picked_questions, file_name)
 
-    with open(file_path, "rb") as doc:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=doc,
-            reply_to_message_id=update.effective_message.message_id,
-            caption=f"📝 **{exam_info['name']}**\n\n"
-                    f"• CBT स्लाइडर मोड (1 सवाल प्रति स्लाइड)\n"
-                    f"• कुल 150 प्रश्न (सिलेबस अनुसार)\n"
-                    f"• Re-attempt बटन उपलब्ध\n\n"
-                    f"📲 Chrome ब्राउज़र में खोलें।"
+def init_db():
+
+    with db_lock:
+        con = db()
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                question TEXT NOT NULL,
+
+                option_a TEXT NOT NULL,
+                option_b TEXT NOT NULL,
+                option_c TEXT NOT NULL,
+                option_d TEXT NOT NULL,
+
+                correct_option INTEGER NOT NULL,
+
+                exam TEXT DEFAULT 'GENERAL',
+                subject TEXT DEFAULT 'GENERAL',
+
+                source_type TEXT DEFAULT 'internet',
+                source_name TEXT,
+                source_url TEXT,
+
+                pdf_file TEXT,
+
+                question_hash TEXT UNIQUE,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pdf_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                telegram_file_id TEXT UNIQUE,
+                telegram_message_id INTEGER,
+
+                channel_id TEXT,
+
+                file_name TEXT,
+                local_path TEXT,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS quiz_history (
+                chat_id TEXT NOT NULL,
+                question_id INTEGER NOT NULL,
+
+                asked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                PRIMARY KEY(chat_id, question_id)
+            )
+        """)
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                name TEXT,
+                url TEXT UNIQUE,
+
+                enabled INTEGER DEFAULT 1,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        con.commit()
+        con.close()
+
+
+# =========================================================
+# NORMALIZATION / DUPLICATE DETECTION
+# =========================================================
+
+def normalize_text(text):
+
+    text = str(text or "")
+
+    text = text.lower()
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    text = re.sub(
+        r"[^\w\s\u0900-\u097F]",
+        "",
+        text,
+    )
+
+    return text.strip()
+
+
+def make_question_hash(
+    question,
+    options,
+):
+
+    data = (
+        normalize_text(question)
+        + "|"
+        + "|".join(
+            normalize_text(x)
+            for x in options
+        )
+    )
+
+    return hashlib.sha256(
+        data.encode("utf-8")
+    ).hexdigest()
+
+
+# =========================================================
+# QUESTION DATABASE
+# =========================================================
+
+def add_question(
+    question,
+    options,
+    correct_option,
+    exam="GENERAL",
+    subject="GENERAL",
+    source_type="internet",
+    source_name="",
+    source_url="",
+    pdf_file="",
+):
+
+    if len(options) != 4:
+        return False, "Exactly 4 options required."
+
+    question = question.strip()
+
+    if not question:
+        return False, "Question is empty."
+
+    if correct_option not in [1, 2, 3, 4]:
+        return False, "Correct option must be 1-4."
+
+    q_hash = make_question_hash(
+        question,
+        options,
+    )
+
+    with db_lock:
+
+        con = db()
+
+        existing = con.execute(
+            """
+            SELECT id
+            FROM questions
+            WHERE question_hash = ?
+            """,
+            (q_hash,),
+        ).fetchone()
+
+        if existing:
+            con.close()
+
+            return (
+                False,
+                f"Duplicate question. Existing ID: {existing[0]}"
+            )
+
+        con.execute(
+            """
+            INSERT INTO questions (
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_option,
+                exam,
+                subject,
+                source_type,
+                source_name,
+                source_url,
+                pdf_file,
+                question_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                question,
+                options[0],
+                options[1],
+                options[2],
+                options[3],
+                correct_option,
+                exam,
+                subject,
+                source_type,
+                source_name,
+                source_url,
+                pdf_file,
+                q_hash,
+            ),
         )
 
-    await status_msg.delete()
-    if os.path.exists(file_path):
-        os.remove(file_path)
+        con.commit()
+        con.close()
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "👋 **राजस्थान CBT टेस्ट बॉट**\n\n"
-        "परीक्षा का नाम लिखकर टेस्ट मांगें:\n"
-        "👉 `CET test` (150 Qs)\n"
-        "👉 `Police test` (150 Qs)\n"
-        "👉 `REET test` (150 Qs)"
+    return True, "Question added."
+
+
+# =========================================================
+# GET QUESTIONS
+# =========================================================
+
+def get_questions(
+    exam=None,
+    subject=None,
+    limit=20,
+):
+
+    with db_lock:
+
+        con = db()
+
+        query = """
+            SELECT
+                id,
+                question,
+                option_a,
+                option_b,
+                option_c,
+                option_d,
+                correct_option,
+                exam,
+                subject,
+                source_type,
+                source_name,
+                source_url
+            FROM questions
+            WHERE 1=1
+        """
+
+        params = []
+
+        if exam:
+
+            query += " AND exam = ?"
+
+            params.append(exam)
+
+        if subject:
+
+            query += " AND subject = ?"
+
+            params.append(subject)
+
+        query += """
+            ORDER BY RANDOM()
+            LIMIT ?
+        """
+
+        params.append(limit)
+
+        rows = con.execute(
+            query,
+            params,
+        ).fetchall()
+
+        con.close()
+
+    return rows
+
+
+# =========================================================
+# GET QUESTIONS WITHOUT PREVIOUSLY ASKED QUESTIONS
+# =========================================================
+
+def get_unused_questions(
+    chat_id,
+    exam=None,
+    subject=None,
+    limit=20,
+):
+
+    with db_lock:
+
+        con = db()
+
+        query = """
+            SELECT
+                q.id,
+                q.question,
+                q.option_a,
+                q.option_b,
+                q.option_c,
+                q.option_d,
+                q.correct_option,
+                q.exam,
+                q.subject,
+                q.source_type,
+                q.source_name,
+                q.source_url
+            FROM questions q
+            LEFT JOIN quiz_history h
+                ON q.id = h.question_id
+                AND h.chat_id = ?
+            WHERE h.question_id IS NULL
+        """
+
+        params = [str(chat_id)]
+
+        if exam:
+
+            query += " AND q.exam = ?"
+
+            params.append(exam)
+
+        if subject:
+
+            query += " AND q.subject = ?"
+
+            params.append(subject)
+
+        query += """
+            ORDER BY RANDOM()
+            LIMIT ?
+        """
+
+        params.append(limit)
+
+        rows = con.execute(
+            query,
+            params,
+        ).fetchall()
+
+        con.close()
+
+    return rows
+
+
+# =========================================================
+# MARK QUESTIONS AS USED
+# =========================================================
+
+def mark_questions_used(
+    chat_id,
+    question_ids,
+):
+
+    with db_lock:
+
+        con = db()
+
+        for qid in question_ids:
+
+            con.execute(
+                """
+                INSERT OR IGNORE INTO quiz_history
+                (
+                    chat_id,
+                    question_id
+                )
+                VALUES (?, ?)
+                """,
+                (
+                    str(chat_id),
+                    qid,
+                ),
+            )
+
+        con.commit()
+        con.close()
+
+
+# =========================================================
+# RESET HISTORY
+# =========================================================
+
+def reset_history(chat_id):
+
+    with db_lock:
+
+        con = db()
+
+        con.execute(
+            """
+            DELETE FROM quiz_history
+            WHERE chat_id = ?
+            """,
+            (str(chat_id),),
+        )
+
+        con.commit()
+        con.close()
+
+
+# =========================================================
+# PDF SYNC DATABASE
+# =========================================================
+
+def pdf_already_synced(file_id):
+
+    with db_lock:
+
+        con = db()
+
+        row = con.execute(
+            """
+            SELECT id
+            FROM pdf_files
+            WHERE telegram_file_id = ?
+            """,
+            (file_id,),
+        ).fetchone()
+
+        con.close()
+
+    return row is not None
+
+
+def save_pdf_record(
+    file_id,
+    message_id,
+    channel_id,
+    file_name,
+    local_path,
+):
+
+    with db_lock:
+
+        con = db()
+
+        con.execute(
+            """
+            INSERT OR IGNORE INTO pdf_files
+            (
+                telegram_file_id,
+                telegram_message_id,
+                channel_id,
+                file_name,
+                local_path
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                file_id,
+                message_id,
+                str(channel_id),
+                file_name,
+                local_path,
+            ),
+        )
+
+        con.commit()
+        con.close()
+
+
+# =========================================================
+# PDF DOWNLOAD
+# =========================================================
+
+async def sync_pdf(
+    message,
+    context,
+):
+
+    document = message.document
+
+    if not document:
+        return
+
+    if document.mime_type != "application/pdf":
+        return
+
+    file_id = document.file_id
+
+    if pdf_already_synced(file_id):
+
+        logger.info(
+            "PDF already synced: %s",
+            document.file_name,
+        )
+
+        return
+
+    pdf_dir = Path("synced_pdfs")
+
+    pdf_dir.mkdir(
+        exist_ok=True,
     )
 
-def main():
-    threading.Thread(target=run_health_server, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.Document.PDF, auto_sync_channel_pdf))
-    app.run_polling()
+    safe_name = re.sub(
+        r"[^a-zA-Z0-9._-]",
+        "_",
+        document.file_name or "file.pdf",
+    )
 
-if __name__ == "__main__":
-    main()
+    timestamp = int(time.time())
+
+    local_path = (
+        pdf_dir
+        / f"{timestamp}_{safe_name}"
+    )
+
+    telegram_file = await context.bot.get_file(
+        file_id
+    )
+
+    await telegram_file.download_to_drive(
+        custom_path=str(local_path)
+    )
+
+    channel_id = (
+        message.chat.id
+        if message.chat
+        else ""
+    )
+
+    save_pdf_record(
+        file_id=file_id,
+        message_id=message.message_id,
+        channel_id=channel_id,
+        file_name=document.file_name,
+        local_path=str(local_path),
+    )
+
+    logger.info(
+        "PDF synced: %s",
+        local_path,
+    )
+
+
+# =========================================================
+# CHANNEL PDF HANDLER
+# =========================================================
+
+async def channel_pdf_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    message = update.channel_post
+
+    if not message:
+        return
+
+    await sync_pdf(
+        message,
+        context,
+    )
+
+
+# =========================================================
+# INTERNET QUESTION SOURCE
+# =========================================================
+
+def fetch_source(url):
+
+    headers = {
+        "User-Agent":
+            "QuizBot/1.0 educational question importer"
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=20,
+    )
+
+    response.raise_for_status()
+
+    return response.text
+
+
+# =========================================================
+# GENERIC HTML QUESTION PARSER
+#
+# Expected HTML structure:
+#
+# <div class="question">
+#   <div class="question-text">...</div>
+#   <div class="option">A ...</div>
+#   <div class="option">B ...</div>
+#   <div class="option">C ...</div>
+#   <div class="option">D ...</div>
+#   <div class="answer">2</div>
+# </div>
+#
+# Change selectors for your actual source.
+# =========================================================
+
+def parse_generic_questions(
+    html_text,
+):
+
+    soup = BeautifulSoup(
+        html_text,
+        "html.parser",
+    )
+
+    questions = []
+
+    blocks = soup.select(
+        ".question"
+    )
+
+    for block in blocks:
+
+        q_node = block.select_one(
+            ".question-text"
+        )
+
+        option_nodes = block.select(
+            ".option"
+        )
+
+        answer_node = block.select_one(
+            ".answer"
+        )
+
+        if not q_node:
+            continue
+
+        if len(option_nodes) < 4:
+            continue
+
+        if not answer_node:
+            continue
+
+        question = q_node.get_text(
+            " ",
+            strip=True,
+        )
+
+        options = [
+            x.get_text(
+                " ",
+                strip=True,
+            )
+            for x in option_nodes[:4]
+        ]
+
+        answer_text = answer_node.get_text(
+            " ",
+            strip=True,
+        )
+
+        match = re.search(
+            r"[1-4]",
+            answer_text,
+        )
+
+        if not match:
+            continue
+
+        correct = int(
+            match.group()
+        )
+
+        questions.append(
+            {
+                "question": question,
+                "options": options,
+                "correct_option": correct,
+            }
+        )
+
+    return questions
+
+
+# =========================================================
+# IMPORT ONE INTERNET SOURCE
+# =========================================================
+
+def import_internet_source(
+    name,
+    url,
+    exam="GENERAL",
+    subject="GENERAL",
+):
+
+    logger.info(
+        "Importing source: %s",
+        url,
+    )
+
+    try:
+
+        page = fetch_source(url)
+
+        questions = parse_generic_questions(
+            page
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Source import failed"
+        )
+
+        return {
+            "success": False,
+            "error": str(e),
+            "added": 0,
+            "duplicates": 0,
+        }
+
+    added = 0
+    duplicates = 0
+
+    for item in questions:
+
+        ok, message = add_question(
+            question=item["question"],
+            options=item["options"],
+            correct_option=item["correct_option"],
+            exam=exam,
+            subject=subject,
+            source_type="internet",
+            source_name=name,
+            source_url=url,
+        )
+
+        if ok:
+            added += 1
+        else:
+            if "Duplicate" in message:
+                duplicates += 1
+
+    return {
+        "success": True,
+        "found": len(questions),
+        "added": added,
+        "duplicates": duplicates,
+    }
+
+
+# =========================================================
+# ADMIN INTERNET SYNC
+# =========================================================
+
+async def syncinternet_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    if not INTERNET_SOURCES:
+
+        await update.message.reply_text(
+            "INTERNET_SOURCES में कोई source configured नहीं है."
+        )
+
+        return
+
+    await update.message.reply_text(
+        "Internet sources sync शुरू हो रहा है..."
+    )
+
+    total_added = 0
+    total_duplicates = 0
+
+    for source in INTERNET_SOURCES:
+
+        result = import_internet_source(
+            name=source["name"],
+            url=source["url"],
+        )
+
+        total_added += result.get(
+            "added",
+            0,
+        )
+
+        total_duplicates += result.get(
+            "duplicates",
+            0,
+        )
+
+    await update.message.reply_text(
+        "Internet Sync Complete\n\n"
+        f"New Questions: {total_added}\n"
+        f"Duplicates skipped: {total_duplicates}"
+    )
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    await update.message.reply_text(
+        "Quiz Bot Online\n\n"
+        "/quiz - Quiz शुरू करें\n"
+        "/stats - Question statistics\n"
+        "/reset - अपनी quiz history reset करें\n"
+        "/syncinternet - Internet sources sync करें\n"
+        "/help - Commands"
+    )
+
+
+# =========================================================
+# /QUIZ
+# =========================================================
+
+async def quiz_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    chat_id = update.effective_chat.id
+
+    try:
+
+        count = int(
+            context.args[0]
+        ) if context.args else DEFAULT_QUIZ_SIZE
+
+    except ValueError:
+
+        count = DEFAULT_QUIZ_SIZE
+
+    count = max(
+        1,
+        min(count, 100),
+    )
+
+    questions = get_unused_questions(
+        chat_id=chat_id,
+        limit=count,
+    )
+
+    # If previous questions exhausted,
+    # reset history and start a new cycle.
+
+    if len(questions) < count:
+
+        reset_history(
+            chat_id
+        )
+
+        questions = get_unused_questions(
+            chat_id=chat_id,
+            limit=count,
+        )
+
+    if not questions:
+
+        await update.message.reply_text(
+            "Database में अभी कोई question available नहीं है."
+        )
+
+        return
+
+    mark_questions_used(
+        chat_id,
+        [row[0] for row in questions],
+    )
+
+    random.shuffle(
+        questions
+    )
+
+    await update.message.reply_text(
+        f"Quiz शुरू हो रहा है.\n"
+        f"Questions: {len(questions)}"
+    )
+
+    for index, row in enumerate(
+        questions,
+        start=1,
+    ):
+
+        (
+            qid,
+            question,
+            a,
+            b,
+            c,
+            d,
+            correct,
+            exam,
+            subject,
+            source_type,
+            source_name,
+            source_url,
+        ) = row
+
+        options = [
+            a,
+            b,
+            c,
+            d,
+        ]
+
+        # Shuffle options while preserving
+        # correct answer.
+
+        correct_text = options[
+            correct - 1
+        ]
+
+        random.shuffle(
+            options
+        )
+
+        new_correct = (
+            options.index(
+                correct_text
+            ) + 1
+        )
+
+        text = (
+            f"<b>Q{index}.</b> "
+            f"{html.escape(question)}\n\n"
+            f"1. {html.escape(options[0])}\n"
+            f"2. {html.escape(options[
