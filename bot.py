@@ -7369,18 +7369,18 @@ def build_application():
     # ========================================================
 
     application.add_handler(
-    CallbackQueryHandler(
-        answer_callback,
-        pattern=r"^ans:"
+        CallbackQueryHandler(
+            answer_callback,
+            pattern=r"^ans:"
+        )
     )
-)
 
-application.add_handler(
-    CallbackQueryHandler(
-        stop_quiz_callback,
-        pattern=r"^stopquiz:"
+    application.add_handler(
+        CallbackQueryHandler(
+            stop_quiz_callback,
+            pattern=r"^stopquiz:"
+        )
     )
-)
     # ========================================================
     # TEXT INPUT
     #
