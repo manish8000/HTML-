@@ -1,14 +1,16 @@
 import os
+import re
 import json
 import random
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import pdfplumber
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
-# Koyeb Port 8000 Health Check Server
+# 1. Koyeb Port 8000 Health Check Server (पुराना फीचर - Safe)
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -23,7 +25,7 @@ def run_health_server():
 # रिपीट रोकने के लिए हिस्ट्री
 user_asked_history = {}
 
-# राजस्थान परीक्षाओं का 150 प्रश्नों का सिलेबस एवं वेटेज डेटाबेस
+# 2. राजस्थान परीक्षाओं का 150 प्रश्नों का आधिकारिक डेटाबेस (पुराना फीचर)
 EXAM_DATABASE = {
     "cet": {
         "name": "Rajasthan CET (Full Paper - 150 Qs)",
@@ -125,7 +127,58 @@ EXAM_DATABASE = {
     }
 }
 
-# 150 प्रश्नों का निर्माण (सिलेबस वेटेज के अनुसार)
+# ==================== [नया फ़ीचर: चैनल की PDF से सवाल निकालना] ====================
+def extract_questions_from_pdf(pdf_path):
+    extracted = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    full_text += text + "\n"
+
+        # सवाल और ऑप्शन अलग करने का साधारण पार्सर
+        raw_blocks = re.split(r'\n(?=(?:प्रश्न|प्र\.|Q)\s*\d+[\.\:])', full_text)
+        for block in raw_blocks:
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
+            if len(lines) >= 5:
+                q_line = lines[0]
+                opts = lines[1:5]
+                # सही उत्तर पहचानना (A, B, C, D)
+                ans = 0
+                if "उत्तर: (B)" in block or "Ans: B" in block or "(ख)" in block: ans = 1
+                elif "उत्तर: (C)" in block or "Ans: C" in block or "(ग)" in block: ans = 2
+                elif "उत्तर: (D)" in block or "Ans: D" in block or "(घ)" in block: ans = 3
+                
+                extracted.append((q_line, opts, ans))
+    except Exception as e:
+        print(f"PDF extraction error: {e}")
+    return extracted
+
+# जब चैनल में कोई PDF किताब अपलोड हो तो अपने आप सवाल बैंक में जोड़ना
+async def auto_sync_channel_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.channel_post
+    if not message or not message.document:
+        return
+
+    if message.document.mime_type == "application/pdf":
+        file_name = message.document.file_name
+        doc_file = await message.document.get_file()
+        local_path = f"temp_{random.randint(100,999)}_{file_name}"
+        await doc_file.download_to_drive(local_path)
+
+        new_qs = extract_questions_from_pdf(local_path)
+        if new_qs:
+            # नए सवालों को CET और राजस्थान GK बैंक में जोड़ना
+            EXAM_DATABASE["cet"]["sample_bank"]["rajasthan_gk"].extend(new_qs)
+            print(f"✅ चैनल की किताब '{file_name}' से {len(new_qs)} नए सवाल डेटाबेस में जुड़े!")
+
+        if os.path.exists(local_path):
+            os.remove(local_path)
+# ===================================================================================
+
+# 3. 150 प्रश्नों का निर्माण (सिलेबस वेटेज अनुसार - पुराना फीचर)
 def generate_full_paper_questions(exam_key, chat_id):
     exam_info = EXAM_DATABASE[exam_key]
     quota_dict = exam_info["syllabus_quota"]
@@ -158,7 +211,7 @@ def generate_full_paper_questions(exam_key, chat_id):
     random.shuffle(full_questions_list)
     return full_questions_list
 
-# CBT स्लाइड-वाइज HTML जनरेटर (1 सवाल प्रति स्क्रीन + Re-attempt)
+# 4. CBT स्लाइड-वाइज HTML जनरेटर (Next, Previous, Re-attempt सहित - पुराना फीचर)
 def build_html_file(exam_title, questions_list, file_name):
     html_code = f"""<!DOCTYPE html>
 <html lang="hi">
@@ -385,7 +438,7 @@ def build_html_file(exam_title, questions_list, file_name):
         f.write(html_code)
     return file_name
 
-# टेलीग्राम मैसेज हैंडलर
+# 5. मैसेज हैंडलर (पुराना फीचर)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.lower().strip()
     chat_id = str(update.effective_chat.id)
@@ -403,7 +456,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     exam_info = EXAM_DATABASE[selected_key]
     status_msg = await update.effective_message.reply_text(
-        f"⏳ **{exam_info['name']} का फुल CBT टेस्ट बन रहा है...**"
+        f"⏳ **{exam_info['name']} का फुल CBT टेस्ट तैयार हो रहा है...**"
     )
 
     picked_questions = generate_full_paper_questions(selected_key, chat_id)
@@ -439,9 +492,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
     app = ApplicationBuilder().token(TOKEN).build()
+    
+    # 1. स्टार्ट कमांड
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+    
+    # 2. ग्रुप/पर्सनल चैट में टेस्ट का र
