@@ -1,25 +1,33 @@
 import os
 import re
 import json
-import html
 import time
-import random
+import html
 import hashlib
-import sqlite3
 import logging
+import sqlite3
 import threading
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from flask import Flask
 
-from telegram import Update
+from groq import Groq
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -29,33 +37,45 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# Telegram channel username or ID
+# Telegram channel ID.
 # Example:
 # CHANNEL_ID=-1001234567890
 CHANNEL_ID = os.getenv("CHANNEL_ID", "")
 
+# Admin Telegram IDs:
+# ADMIN_IDS=123456789,987654321
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+PORT = int(os.getenv("PORT", "8000"))
+
 DB_PATH = os.getenv("DB_PATH", "quizbot.db")
 
-PORT = int(os.getenv("PORT", "8080"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+PDF_DIR = DATA_DIR / "pdfs"
 
-DEFAULT_QUIZ_SIZE = 20
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PDF_DIR.mkdir(parents=True, exist_ok=True)
 
-# Internet sources
-# Add only sources that allow reuse/API access.
-#
-# Format:
-# {
-#     "name": "My Source",
-#     "url": "https://example.com/questions"
-# }
-INTERNET_SOURCES = [
-    # {
-    #     "name": "Example Source",
-    #     "url": "https://example.com/questions"
-    # }
-]
+
+# Groq model can be changed through Koyeb environment variable.
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "llama-3.3-70b-versatile"
+)
+
+REQUEST_TIMEOUT = 25
+
+QUIZ_DEFAULT_COUNT = 10
+
+# Negative marking:
+NEGATIVE_MARK = 0.25
 
 
 # =========================================================
@@ -63,35 +83,97 @@ INTERNET_SOURCES = [
 # =========================================================
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("quizbot")
+
+
+# =========================================================
+# INTERNET SOURCES
+# =========================================================
+
+INTERNET_SOURCES = [
+    {
+        "name": "RajRAS",
+        "url": "https://rajras.in/hi/ras/mains/books/",
+        "type": "reference",
+    },
+    {
+        "name": "RBSE Official",
+        "url": "https://rajeduboard.rajasthan.gov.in/books/index.htm",
+        "type": "official_reference",
+    },
+    {
+        "name": "Samyak IAS RBSE Books",
+        "url": "https://samyakias.com/samyak/rbse-books.php",
+        "type": "reference",
+    },
+    {
+        "name": "NCERT Books Guru",
+        "url": "https://www-ncertbooks-guru.translate.goog/rbse-books-pdf/?_x_tr_sl=en&_x_tr_tl=hi&_x_tr_hl=hi&_x_tr_pto=tc",
+        "type": "reference",
+    },
+    {
+        "name": "Online2Study India GK",
+        "url": "https://www.online2study.in/2020/01/indiagkpdf.html",
+        "type": "reference",
+    },
+]
+
+
+# =========================================================
+# GLOBAL STATE
+# =========================================================
+
+DB_LOCK = threading.Lock()
+
+ACTIVE_QUIZZES = {}
+
+# Structure:
+#
+# ACTIVE_QUIZZES[user_id] = {
+#     "questions": [...],
+#     "index": 0,
+#     "score": 0,
+#     "correct": 0,
+#     "wrong": 0,
+#     "skipped": 0,
+#     "started_at": timestamp
+# }
 
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-db_lock = threading.Lock()
-
-
 def db():
-    return sqlite3.connect(
+    conn = sqlite3.connect(
         DB_PATH,
-        check_same_thread=False,
         timeout=30,
+        check_same_thread=False
     )
+
+    conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    return conn
 
 
 def init_db():
 
-    with db_lock:
-        con = db()
+    with DB_LOCK:
 
-        con.execute("""
+        conn = db()
+
+        conn.executescript(
+            """
+
             CREATE TABLE IF NOT EXISTS questions (
+
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 question TEXT NOT NULL,
@@ -103,533 +185,576 @@ def init_db():
 
                 correct_option INTEGER NOT NULL,
 
-                exam TEXT DEFAULT 'GENERAL',
-                subject TEXT DEFAULT 'GENERAL',
+                explanation TEXT DEFAULT '',
 
-                source_type TEXT DEFAULT 'internet',
-                source_name TEXT,
-                source_url TEXT,
+                exam TEXT DEFAULT 'General',
+                subject TEXT DEFAULT 'General',
 
-                pdf_file TEXT,
+                source_type TEXT DEFAULT 'manual',
+                source_name TEXT DEFAULT '',
+                source_url TEXT DEFAULT '',
 
-                question_hash TEXT UNIQUE,
+                question_hash TEXT UNIQUE NOT NULL,
 
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+                active INTEGER DEFAULT 1,
 
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS pdf_files (
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+
+            );
+
+
+            CREATE TABLE IF NOT EXISTS quiz_history (
+
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-                telegram_file_id TEXT UNIQUE,
-                telegram_message_id INTEGER,
+                user_id INTEGER NOT NULL,
 
-                channel_id TEXT,
-
-                file_name TEXT,
-                local_path TEXT,
-
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS quiz_history (
-                chat_id TEXT NOT NULL,
                 question_id INTEGER NOT NULL,
 
-                asked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                answered_at TEXT DEFAULT CURRENT_TIMESTAMP,
 
-                PRIMARY KEY(chat_id, question_id)
-            )
-        """)
+                UNIQUE(user_id, question_id),
 
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS sources (
+                FOREIGN KEY(question_id)
+                    REFERENCES questions(id)
+                    ON DELETE CASCADE
+
+            );
+
+
+            CREATE TABLE IF NOT EXISTS users (
+
+                user_id INTEGER PRIMARY KEY,
+
+                username TEXT DEFAULT '',
+
+                first_name TEXT DEFAULT '',
+
+                total_quizzes INTEGER DEFAULT 0,
+
+                total_questions INTEGER DEFAULT 0,
+
+                correct_answers INTEGER DEFAULT 0,
+
+                wrong_answers INTEGER DEFAULT 0,
+
+                skipped_answers INTEGER DEFAULT 0,
+
+                score REAL DEFAULT 0,
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+
+            );
+
+
+            CREATE TABLE IF NOT EXISTS pdf_files (
+
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
-                name TEXT,
-                url TEXT UNIQUE,
+                telegram_file_id TEXT UNIQUE NOT NULL,
+
+                file_unique_id TEXT DEFAULT '',
+
+                file_name TEXT DEFAULT '',
+
+                file_size INTEGER DEFAULT 0,
+
+                channel_id TEXT DEFAULT '',
+
+                message_id INTEGER DEFAULT 0,
+
+                caption TEXT DEFAULT '',
+
+                local_path TEXT DEFAULT '',
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+
+            );
+
+
+            CREATE TABLE IF NOT EXISTS sources (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                name TEXT UNIQUE NOT NULL,
+
+                url TEXT NOT NULL,
+
+                source_type TEXT DEFAULT 'reference',
 
                 enabled INTEGER DEFAULT 1,
 
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                last_crawled TEXT DEFAULT '',
+
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+
+            );
+
+
+            CREATE INDEX IF NOT EXISTS idx_questions_exam
+            ON questions(exam);
+
+
+            CREATE INDEX IF NOT EXISTS idx_questions_subject
+            ON questions(subject);
+
+
+            CREATE INDEX IF NOT EXISTS idx_questions_hash
+            ON questions(question_hash);
+
+
+            CREATE INDEX IF NOT EXISTS idx_history_user
+            ON quiz_history(user_id);
+
+            """
+        )
+
+        for source in INTERNET_SOURCES:
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sources
+                (name, url, source_type)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    source["name"],
+                    source["url"],
+                    source["type"],
+                )
             )
-        """)
 
-        con.commit()
-        con.close()
+        conn.commit()
+        conn.close()
 
 
 # =========================================================
-# NORMALIZATION / DUPLICATE DETECTION
+# TEXT NORMALIZATION
 # =========================================================
 
-def normalize_text(text):
+def normalize_text(text: str) -> str:
 
-    text = str(text or "")
+    if not text:
+        return ""
+
+    text = html.unescape(text)
 
     text = text.lower()
 
     text = re.sub(
         r"\s+",
         " ",
-        text,
+        text
     )
 
     text = re.sub(
-        r"[^\w\s\u0900-\u097F]",
-        "",
-        text,
+        r"[^\w\s\u0900-\u097f]",
+        " ",
+        text
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
     )
 
     return text.strip()
 
 
-def make_question_hash(
-    question,
-    options,
-):
+def question_hash(question, options):
 
-    data = (
-        normalize_text(question)
-        + "|"
-        + "|".join(
-            normalize_text(x)
-            for x in options
-        )
-    )
+    raw = normalize_text(question)
+
+    for option in options:
+        raw += "|" + normalize_text(option)
 
     return hashlib.sha256(
-        data.encode("utf-8")
+        raw.encode("utf-8")
     ).hexdigest()
 
 
 # =========================================================
-# QUESTION DATABASE
+# USER
+# =========================================================
+
+def ensure_user(user):
+
+    if not user:
+        return
+
+    with DB_LOCK:
+
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO users
+            (
+                user_id,
+                username,
+                first_name
+            )
+            VALUES (?, ?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+
+                username=excluded.username,
+                first_name=excluded.first_name,
+                updated_at=CURRENT_TIMESTAMP
+
+            """,
+            (
+                user.id,
+                user.username or "",
+                user.first_name or "",
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+
+# =========================================================
+# QUESTION INSERT
 # =========================================================
 
 def add_question(
     question,
     options,
     correct_option,
-    exam="GENERAL",
-    subject="GENERAL",
-    source_type="internet",
+    explanation="",
+    exam="General",
+    subject="General",
+    source_type="manual",
     source_name="",
     source_url="",
-    pdf_file="",
 ):
 
     if len(options) != 4:
         return False, "Exactly 4 options required."
 
+    if correct_option not in [0, 1, 2, 3]:
+        return False, "Correct option must be 0-3."
+
     question = question.strip()
 
     if not question:
-        return False, "Question is empty."
+        return False, "Question empty."
 
-    if correct_option not in [1, 2, 3, 4]:
-        return False, "Correct option must be 1-4."
-
-    q_hash = make_question_hash(
+    q_hash = question_hash(
         question,
-        options,
+        options
     )
 
-    with db_lock:
+    with DB_LOCK:
 
-        con = db()
+        conn = db()
 
-        existing = con.execute(
-            """
-            SELECT id
-            FROM questions
-            WHERE question_hash = ?
-            """,
-            (q_hash,),
-        ).fetchone()
+        try:
 
-        if existing:
-            con.close()
-
-            return (
-                False,
-                f"Duplicate question. Existing ID: {existing[0]}"
-            )
-
-        con.execute(
-            """
-            INSERT INTO questions (
-                question,
-                option_a,
-                option_b,
-                option_c,
-                option_d,
-                correct_option,
-                exam,
-                subject,
-                source_type,
-                source_name,
-                source_url,
-                pdf_file,
-                question_hash
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                question,
-                options[0],
-                options[1],
-                options[2],
-                options[3],
-                correct_option,
-                exam,
-                subject,
-                source_type,
-                source_name,
-                source_url,
-                pdf_file,
-                q_hash,
-            ),
-        )
-
-        con.commit()
-        con.close()
-
-    return True, "Question added."
-
-
-# =========================================================
-# GET QUESTIONS
-# =========================================================
-
-def get_questions(
-    exam=None,
-    subject=None,
-    limit=20,
-):
-
-    with db_lock:
-
-        con = db()
-
-        query = """
-            SELECT
-                id,
-                question,
-                option_a,
-                option_b,
-                option_c,
-                option_d,
-                correct_option,
-                exam,
-                subject,
-                source_type,
-                source_name,
-                source_url
-            FROM questions
-            WHERE 1=1
-        """
-
-        params = []
-
-        if exam:
-
-            query += " AND exam = ?"
-
-            params.append(exam)
-
-        if subject:
-
-            query += " AND subject = ?"
-
-            params.append(subject)
-
-        query += """
-            ORDER BY RANDOM()
-            LIMIT ?
-        """
-
-        params.append(limit)
-
-        rows = con.execute(
-            query,
-            params,
-        ).fetchall()
-
-        con.close()
-
-    return rows
-
-
-# =========================================================
-# GET QUESTIONS WITHOUT PREVIOUSLY ASKED QUESTIONS
-# =========================================================
-
-def get_unused_questions(
-    chat_id,
-    exam=None,
-    subject=None,
-    limit=20,
-):
-
-    with db_lock:
-
-        con = db()
-
-        query = """
-            SELECT
-                q.id,
-                q.question,
-                q.option_a,
-                q.option_b,
-                q.option_c,
-                q.option_d,
-                q.correct_option,
-                q.exam,
-                q.subject,
-                q.source_type,
-                q.source_name,
-                q.source_url
-            FROM questions q
-            LEFT JOIN quiz_history h
-                ON q.id = h.question_id
-                AND h.chat_id = ?
-            WHERE h.question_id IS NULL
-        """
-
-        params = [str(chat_id)]
-
-        if exam:
-
-            query += " AND q.exam = ?"
-
-            params.append(exam)
-
-        if subject:
-
-            query += " AND q.subject = ?"
-
-            params.append(subject)
-
-        query += """
-            ORDER BY RANDOM()
-            LIMIT ?
-        """
-
-        params.append(limit)
-
-        rows = con.execute(
-            query,
-            params,
-        ).fetchall()
-
-        con.close()
-
-    return rows
-
-
-# =========================================================
-# MARK QUESTIONS AS USED
-# =========================================================
-
-def mark_questions_used(
-    chat_id,
-    question_ids,
-):
-
-    with db_lock:
-
-        con = db()
-
-        for qid in question_ids:
-
-            con.execute(
+            conn.execute(
                 """
-                INSERT OR IGNORE INTO quiz_history
+                INSERT INTO questions
                 (
-                    chat_id,
-                    question_id
+                    question,
+                    option_a,
+                    option_b,
+                    option_c,
+                    option_d,
+                    correct_option,
+                    explanation,
+                    exam,
+                    subject,
+                    source_type,
+                    source_name,
+                    source_url,
+                    question_hash
                 )
-                VALUES (?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    str(chat_id),
-                    qid,
-                ),
+                    question,
+                    options[0],
+                    options[1],
+                    options[2],
+                    options[3],
+                    correct_option,
+                    explanation,
+                    exam,
+                    subject,
+                    source_type,
+                    source_name,
+                    source_url,
+                    q_hash,
+                )
             )
 
-        con.commit()
-        con.close()
+            conn.commit()
+
+            return True, "inserted"
+
+        except sqlite3.IntegrityError:
+
+            return False, "duplicate"
+
+        finally:
+
+            conn.close()
 
 
 # =========================================================
-# RESET HISTORY
+# QUESTION FETCH
 # =========================================================
 
-def reset_history(chat_id):
+def get_quiz_questions(
+    user_id,
+    count=10,
+    exam=None,
+    subject=None
+):
 
-    with db_lock:
+    conn = db()
 
-        con = db()
+    conditions = [
+        "q.active = 1",
+        """
+        q.id NOT IN (
+            SELECT question_id
+            FROM quiz_history
+            WHERE user_id = ?
+        )
+        """
+    ]
 
-        con.execute(
+    params = [user_id]
+
+    if exam:
+        conditions.append(
+            "q.exam = ?"
+        )
+        params.append(exam)
+
+    if subject:
+        conditions.append(
+            "q.subject = ?"
+        )
+        params.append(subject)
+
+    sql = f"""
+        SELECT q.*
+        FROM questions q
+        WHERE {" AND ".join(conditions)}
+        ORDER BY RANDOM()
+        LIMIT ?
+    """
+
+    params.append(count)
+
+    rows = conn.execute(
+        sql,
+        params
+    ).fetchall()
+
+    conn.close()
+
+    return [dict(row) for row in rows]
+
+
+# =========================================================
+# MARK QUESTION USED
+# =========================================================
+
+def mark_question_used(
+    user_id,
+    question_id
+):
+
+    with DB_LOCK:
+
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO quiz_history
+            (
+                user_id,
+                question_id
+            )
+            VALUES (?, ?)
+            """,
+            (
+                user_id,
+                question_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+
+# =========================================================
+# RESET USER HISTORY
+# =========================================================
+
+def reset_user_history(user_id):
+
+    with DB_LOCK:
+
+        conn = db()
+
+        conn.execute(
             """
             DELETE FROM quiz_history
-            WHERE chat_id = ?
+            WHERE user_id = ?
             """,
-            (str(chat_id),),
+            (user_id,)
         )
 
-        con.commit()
-        con.close()
+        conn.commit()
+        conn.close()
 
 
 # =========================================================
-# PDF SYNC DATABASE
+# STATS
 # =========================================================
 
-def pdf_already_synced(file_id):
+def get_stats(user_id):
 
-    with db_lock:
+    conn = db()
 
-        con = db()
+    row = conn.execute(
+        """
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+        """,
+        (user_id,)
+    ).fetchone()
 
-        row = con.execute(
-            """
-            SELECT id
-            FROM pdf_files
-            WHERE telegram_file_id = ?
-            """,
-            (file_id,),
-        ).fetchone()
+    used = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM quiz_history
+        WHERE user_id = ?
+        """,
+        (user_id,)
+    ).fetchone()[0]
 
-        con.close()
+    total_questions = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM questions
+        WHERE active = 1
+        """
+    ).fetchone()[0]
 
-    return row is not None
+    conn.close()
+
+    if not row:
+
+        return {
+            "total_quizzes": 0,
+            "total_questions": 0,
+            "correct": 0,
+            "wrong": 0,
+            "skipped": 0,
+            "score": 0,
+            "used": used,
+            "available": total_questions,
+        }
+
+    return {
+        "total_quizzes": row["total_quizzes"],
+        "total_questions": row["total_questions"],
+        "correct": row["correct_answers"],
+        "wrong": row["wrong_answers"],
+        "skipped": row["skipped_answers"],
+        "score": row["score"],
+        "used": used,
+        "available": total_questions,
+    }
 
 
-def save_pdf_record(
-    file_id,
-    message_id,
-    channel_id,
-    file_name,
-    local_path,
+# =========================================================
+# UPDATE USER STATS
+# =========================================================
+
+def update_user_stats(
+    user_id,
+    total,
+    correct,
+    wrong,
+    skipped,
+    score
 ):
 
-    with db_lock:
+    with DB_LOCK:
 
-        con = db()
+        conn = db()
 
-        con.execute(
+        conn.execute(
             """
-            INSERT OR IGNORE INTO pdf_files
+            UPDATE users
+
+            SET
+                total_quizzes =
+                    total_quizzes + 1,
+
+                total_questions =
+                    total_questions + ?,
+
+                correct_answers =
+                    correct_answers + ?,
+
+                wrong_answers =
+                    wrong_answers + ?,
+
+                skipped_answers =
+                    skipped_answers + ?,
+
+                score =
+                    score + ?,
+
+                updated_at =
+                    CURRENT_TIMESTAMP
+
+            WHERE user_id = ?
+
+            """,
             (
-                telegram_file_id,
-                telegram_message_id,
-                channel_id,
-                file_name,
-                local_path
+                total,
+                correct,
+                wrong,
+                skipped,
+                score,
+                user_id
             )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                file_id,
-                message_id,
-                str(channel_id),
-                file_name,
-                local_path,
-            ),
         )
 
-        con.commit()
-        con.close()
+        conn.commit()
+        conn.close()
 
 
 # =========================================================
-# PDF DOWNLOAD
+# ADMIN CHECK
 # =========================================================
 
-async def sync_pdf(
-    message,
-    context,
-):
+def is_admin(user_id):
 
-    document = message.document
-
-    if not document:
-        return
-
-    if document.mime_type != "application/pdf":
-        return
-
-    file_id = document.file_id
-
-    if pdf_already_synced(file_id):
-
-        logger.info(
-            "PDF already synced: %s",
-            document.file_name,
-        )
-
-        return
-
-    pdf_dir = Path("synced_pdfs")
-
-    pdf_dir.mkdir(
-        exist_ok=True,
-    )
-
-    safe_name = re.sub(
-        r"[^a-zA-Z0-9._-]",
-        "_",
-        document.file_name or "file.pdf",
-    )
-
-    timestamp = int(time.time())
-
-    local_path = (
-        pdf_dir
-        / f"{timestamp}_{safe_name}"
-    )
-
-    telegram_file = await context.bot.get_file(
-        file_id
-    )
-
-    await telegram_file.download_to_drive(
-        custom_path=str(local_path)
-    )
-
-    channel_id = (
-        message.chat.id
-        if message.chat
-        else ""
-    )
-
-    save_pdf_record(
-        file_id=file_id,
-        message_id=message.message_id,
-        channel_id=channel_id,
-        file_name=document.file_name,
-        local_path=str(local_path),
-    )
-
-    logger.info(
-        "PDF synced: %s",
-        local_path,
-    )
+    return user_id in ADMIN_IDS
 
 
 # =========================================================
-# CHANNEL PDF HANDLER
+# PDF SYNC
 # =========================================================
 
 async def channel_pdf_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     message = update.channel_post
@@ -637,27 +762,155 @@ async def channel_pdf_handler(
     if not message:
         return
 
-    await sync_pdf(
-        message,
-        context,
+    if CHANNEL_ID:
+
+        try:
+
+            expected = int(CHANNEL_ID)
+
+            if message.chat.id != expected:
+                return
+
+        except ValueError:
+            pass
+
+    if not message.document:
+        return
+
+    document = message.document
+
+    filename = (
+        document.file_name
+        or f"{document.file_unique_id}.pdf"
     )
 
+    if not filename.lower().endswith(".pdf"):
+        return
+
+    with DB_LOCK:
+
+        conn = db()
+
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM pdf_files
+            WHERE telegram_file_id = ?
+            """,
+            (document.file_id,)
+        ).fetchone()
+
+        if existing:
+
+            conn.close()
+
+            logger.info(
+                "PDF already synced: %s",
+                filename
+            )
+
+            return
+
+        conn.execute(
+            """
+            INSERT INTO pdf_files
+            (
+                telegram_file_id,
+                file_unique_id,
+                file_name,
+                file_size,
+                channel_id,
+                message_id,
+                caption
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document.file_id,
+                document.file_unique_id,
+                filename,
+                document.file_size or 0,
+                str(message.chat.id),
+                message.message_id,
+                message.caption or "",
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    try:
+
+        tg_file = await context.bot.get_file(
+            document.file_id
+        )
+
+        safe_name = re.sub(
+            r"[^a-zA-Z0-9._-]",
+            "_",
+            filename
+        )
+
+        destination = (
+            PDF_DIR / safe_name
+        )
+
+        await tg_file.download_to_drive(
+            custom_path=str(destination)
+        )
+
+        with DB_LOCK:
+
+            conn = db()
+
+            conn.execute(
+                """
+                UPDATE pdf_files
+
+                SET local_path = ?
+
+                WHERE telegram_file_id = ?
+
+                """,
+                (
+                    str(destination),
+                    document.file_id
+                )
+            )
+
+            conn.commit()
+            conn.close()
+
+        logger.info(
+            "PDF synced: %s",
+            destination
+        )
+
+    except Exception:
+
+        logger.exception(
+            "PDF download failed"
+        )
+
 
 # =========================================================
-# INTERNET QUESTION SOURCE
+# WEB FETCH
 # =========================================================
 
-def fetch_source(url):
+def fetch_web_page(url):
 
     headers = {
         "User-Agent":
-            "QuizBot/1.0 educational question importer"
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "Chrome/131 Safari/537.36"
     }
 
     response = requests.get(
         url,
         headers=headers,
-        timeout=20,
+        timeout=REQUEST_TIMEOUT
     )
 
     response.raise_for_status()
@@ -666,348 +919,74 @@ def fetch_source(url):
 
 
 # =========================================================
-# GENERIC HTML QUESTION PARSER
-#
-# Expected HTML structure:
-#
-# <div class="question">
-#   <div class="question-text">...</div>
-#   <div class="option">A ...</div>
-#   <div class="option">B ...</div>
-#   <div class="option">C ...</div>
-#   <div class="option">D ...</div>
-#   <div class="answer">2</div>
-# </div>
-#
-# Change selectors for your actual source.
+# EXTRACT PAGE TEXT
 # =========================================================
 
-def parse_generic_questions(
-    html_text,
+def extract_page_text(
+    html_content,
+    max_chars=18000
 ):
 
     soup = BeautifulSoup(
-        html_text,
-        "html.parser",
+        html_content,
+        "html.parser"
     )
 
-    questions = []
-
-    blocks = soup.select(
-        ".question"
-    )
-
-    for block in blocks:
-
-        q_node = block.select_one(
-            ".question-text"
-        )
-
-        option_nodes = block.select(
-            ".option"
-        )
-
-        answer_node = block.select_one(
-            ".answer"
-        )
-
-        if not q_node:
-            continue
-
-        if len(option_nodes) < 4:
-            continue
-
-        if not answer_node:
-            continue
-
-        question = q_node.get_text(
-            " ",
-            strip=True,
-        )
-
-        options = [
-            x.get_text(
-                " ",
-                strip=True,
-            )
-            for x in option_nodes[:4]
+    for tag in soup(
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "footer",
+            "nav"
         ]
-
-        answer_text = answer_node.get_text(
-            " ",
-            strip=True,
-        )
-
-        match = re.search(
-            r"[1-4]",
-            answer_text,
-        )
-
-        if not match:
-            continue
-
-        correct = int(
-            match.group()
-        )
-
-        questions.append(
-            {
-                "question": question,
-                "options": options,
-                "correct_option": correct,
-            }
-        )
-
-    return questions
-
-
-# =========================================================
-# IMPORT ONE INTERNET SOURCE
-# =========================================================
-
-def import_internet_source(
-    name,
-    url,
-    exam="GENERAL",
-    subject="GENERAL",
-):
-
-    logger.info(
-        "Importing source: %s",
-        url,
-    )
-
-    try:
-
-        page = fetch_source(url)
-
-        questions = parse_generic_questions(
-            page
-        )
-
-    except Exception as e:
-
-        logger.exception(
-            "Source import failed"
-        )
-
-        return {
-            "success": False,
-            "error": str(e),
-            "added": 0,
-            "duplicates": 0,
-        }
-
-    added = 0
-    duplicates = 0
-
-    for item in questions:
-
-        ok, message = add_question(
-            question=item["question"],
-            options=item["options"],
-            correct_option=item["correct_option"],
-            exam=exam,
-            subject=subject,
-            source_type="internet",
-            source_name=name,
-            source_url=url,
-        )
-
-        if ok:
-            added += 1
-        else:
-            if "Duplicate" in message:
-                duplicates += 1
-
-    return {
-        "success": True,
-        "found": len(questions),
-        "added": added,
-        "duplicates": duplicates,
-    }
-
-
-# =========================================================
-# ADMIN INTERNET SYNC
-# =========================================================
-
-async def syncinternet_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    if not INTERNET_SOURCES:
-
-        await update.message.reply_text(
-            "INTERNET_SOURCES में कोई source configured नहीं है."
-        )
-
-        return
-
-    await update.message.reply_text(
-        "Internet sources sync शुरू हो रहा है..."
-    )
-
-    total_added = 0
-    total_duplicates = 0
-
-    for source in INTERNET_SOURCES:
-
-        result = import_internet_source(
-            name=source["name"],
-            url=source["url"],
-        )
-
-        total_added += result.get(
-            "added",
-            0,
-        )
-
-        total_duplicates += result.get(
-            "duplicates",
-            0,
-        )
-
-    await update.message.reply_text(
-        "Internet Sync Complete\n\n"
-        f"New Questions: {total_added}\n"
-        f"Duplicates skipped: {total_duplicates}"
-    )
-
-
-# =========================================================
-# /START
-# =========================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    await update.message.reply_text(
-        "Quiz Bot Online\n\n"
-        "/quiz - Quiz शुरू करें\n"
-        "/stats - Question statistics\n"
-        "/reset - अपनी quiz history reset करें\n"
-        "/syncinternet - Internet sources sync करें\n"
-        "/help - Commands"
-    )
-
-
-# =========================================================
-# /QUIZ
-# =========================================================
-
-async def quiz_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-
-    chat_id = update.effective_chat.id
-
-    try:
-
-        count = int(
-            context.args[0]
-        ) if context.args else DEFAULT_QUIZ_SIZE
-
-    except ValueError:
-
-        count = DEFAULT_QUIZ_SIZE
-
-    count = max(
-        1,
-        min(count, 100),
-    )
-
-    questions = get_unused_questions(
-        chat_id=chat_id,
-        limit=count,
-    )
-
-    # If previous questions exhausted,
-    # reset history and start a new cycle.
-
-    if len(questions) < count:
-
-        reset_history(
-            chat_id
-        )
-
-        questions = get_unused_questions(
-            chat_id=chat_id,
-            limit=count,
-        )
-
-    if not questions:
-
-        await update.message.reply_text(
-            "Database में अभी कोई question available नहीं है."
-        )
-
-        return
-
-    mark_questions_used(
-        chat_id,
-        [row[0] for row in questions],
-    )
-
-    random.shuffle(
-        questions
-    )
-
-    await update.message.reply_text(
-        f"Quiz शुरू हो रहा है.\n"
-        f"Questions: {len(questions)}"
-    )
-
-    for index, row in enumerate(
-        questions,
-        start=1,
     ):
+        tag.decompose()
 
-        (
-            qid,
-            question,
-            a,
-            b,
-            c,
-            d,
-            correct,
-            exam,
-            subject,
-            source_type,
-            source_name,
-            source_url,
-        ) = row
+    text = soup.get_text(
+        separator="\n"
+    )
 
-        options = [
-            a,
-            b,
-            c,
-            d,
-        ]
+    lines = []
 
-        # Shuffle options while preserving
-        # correct answer.
+    for line in text.splitlines():
 
-        correct_text = options[
-            correct - 1
-        ]
+        line = re.sub(
+            r"\s+",
+            " ",
+            line
+        ).strip()
 
-        random.shuffle(
-            options
-        )
+        if len(line) >= 3:
+            lines.append(line)
 
-        new_correct = (
-            options.index(
-                correct_text
-            ) + 1
-        )
+    text = "\n".join(lines)
 
-        text = (
-            f"<b>Q{index}.</b> "
-            f"{html.escape(question)}\n\n"
-            f"1. {html.escape(options[0])}\n"
-            f"2. {html.escape(options[
+    return text[:max_chars]
+
+
+# =========================================================
+# SOURCE CRAWLER
+# =========================================================
+
+def crawl_source(
+    source_name
+):
+
+    conn = db()
+
+    source = conn.execute(
+        """
+        SELECT *
+        FROM sources
+        WHERE name = ?
+        AND enabled = 1
+        """,
+        (source_name,)
+    ).fetchone()
+
+    conn.close()
+
+    if not source:
+      
