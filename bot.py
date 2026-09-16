@@ -5499,7 +5499,7 @@ async def document_import_handler(
                 custom_path=str(temp_path)
             )
 
-        result = import_txt(
+                    result = import_txt(
                 file_path=str(temp_path),
                 file_name=filename,
             )
