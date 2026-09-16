@@ -3361,7 +3361,7 @@ async def quiz_command(
 
     user = update.effective_user
 
- ensure_user(user)
+    ensure_user(user)
 
 
 
@@ -3727,7 +3727,7 @@ async def start_command(
     user = update.effective_user
 
     
-ensure_user(user)
+    ensure_user(user)
 
 
 
@@ -4257,7 +4257,7 @@ async def newquiz_command(
     user = update.effective_user
 
     
-ensure_user(user)
+    ensure_user(user)
 
 
 
@@ -7033,7 +7033,7 @@ async def status_command(update, context):
 
     if user:
         
-   ensure_user(user)
+      ensure_user(user)
 
 
 
