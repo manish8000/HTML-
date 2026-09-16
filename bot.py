@@ -5397,7 +5397,9 @@ async def document_import_handler(
 
             # PDF को database में import करें
             result = import_pdf(
-                str(destination)
+                user_id=user.id,
+                file_path=str(destination),
+                file_name=filename,
             )
 
         except Exception:
@@ -5497,8 +5499,9 @@ async def document_import_handler(
                 custom_path=str(temp_path)
             )
 
-            result = import_txt(
-                str(temp_path)
+        result = import_txt(
+                file_path=str(temp_path),
+                file_name=filename,
             )
 
         except Exception:
