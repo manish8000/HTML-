@@ -2953,28 +2953,11 @@ def scrape_and_generate(
         source=source_name,
     )
 
-    saved = []
-
-    for question in questions:
-
-        try:
-
-            question_id = add_question(
-                question
-            )
-
-            if question_id:
-                saved.append(
-                    question_id
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Failed saving scraped question"
-            )
-
-    return saved
+    # ध्यान दें: यह function केवल generate किए गए question
+    # dictionaries लौटाता है, इन्हें database में save नहीं करता।
+    # Saving (add_question) caller (scrape_command) करता है,
+    # ताकि हर question सिर्फ एक बार ही save हो।
+    return questions
     # ============================================================
 # PDF / TXT EXTRACTION
 # ============================================================
@@ -3117,9 +3100,27 @@ def import_questions_from_text(
     source="import",
     count=None
 ):
+    """
+    Returns a stats dict:
+    {
+        "ids": [question_id, ...],   # actually-added question ids
+        "added": int,
+        "duplicate": int,
+        "failed": int,
+        "total": int,
+    }
+    """
+
+    empty_result = {
+        "ids": [],
+        "added": 0,
+        "duplicate": 0,
+        "failed": 0,
+        "total": 0,
+    }
 
     if not text:
-        return []
+        return empty_result
 
     text = str(text)
 
@@ -3154,19 +3155,25 @@ def import_questions_from_text(
     )
 
     saved_ids = []
+    added = 0
+    duplicate = 0
+    failed = 0
 
     for question in questions:
 
         try:
 
-            question_id = add_question(
+            question_id, status = add_question(
                 question
             )
 
-            if question_id:
-                saved_ids.append(
-                    question_id
-                )
+            if question_id and status == "added":
+                added += 1
+                saved_ids.append(question_id)
+            elif question_id and status == "duplicate":
+                duplicate += 1
+            else:
+                failed += 1
 
         except Exception:
 
@@ -3174,7 +3181,15 @@ def import_questions_from_text(
                 "Imported question save failed"
             )
 
-    return saved_ids
+            failed += 1
+
+    return {
+        "ids": saved_ids,
+        "added": added,
+        "duplicate": duplicate,
+        "failed": failed,
+        "total": len(questions),
+    }
 
 
 # ============================================================
@@ -3192,8 +3207,16 @@ def import_pdf(
         file_path
     )
 
+    empty_result = {
+        "ids": [],
+        "added": 0,
+        "duplicate": 0,
+        "failed": 0,
+        "total": 0,
+    }
+
     if not text.strip():
-        return []
+        return empty_result
 
     pdf_id = save_pdf_file(
         user_id=user_id,
@@ -3201,13 +3224,13 @@ def import_pdf(
         file_path=file_path,
     )
 
-    saved_ids = import_questions_from_text(
+    result = import_questions_from_text(
         text=text,
         source=file_name,
         count=count,
     )
 
-    return saved_ids
+    return result
 
 
 # ============================================================
@@ -3224,8 +3247,16 @@ def import_txt(
         file_path
     )
 
+    empty_result = {
+        "ids": [],
+        "added": 0,
+        "duplicate": 0,
+        "failed": 0,
+        "total": 0,
+    }
+
     if not text.strip():
-        return []
+        return empty_result
 
     return import_questions_from_text(
         text=text,
@@ -3710,6 +3741,41 @@ def save_quiz_questions(
         )
 
     return True
+
+
+# ============================================================
+# CREATE QUIZ FROM A LIST OF QUESTION IDS
+# (used to auto-build a quiz right after PDF/TXT import,
+# HTML scrape, or AI generation)
+# ============================================================
+
+def create_quiz_from_question_ids(
+    user_id,
+    title,
+    question_ids,
+    exam=None,
+    subject=None
+):
+
+    if not question_ids:
+        return None
+
+    quiz_id = create_quiz(
+        user_id=user_id,
+        title=title,
+        exam=exam,
+        subject=subject,
+    )
+
+    if not quiz_id:
+        return None
+
+    save_quiz_questions(
+        quiz_id,
+        question_ids
+    )
+
+    return quiz_id
 
 
 # ============================================================
@@ -5676,27 +5742,33 @@ async def pending_text_handler(
 
     if action == "add":
 
-        question_id = add_question(
+        question_id, status = add_question(
             data
         )
 
-        if question_id:
+        PENDING.pop(
+            user_id,
+            None
+        )
 
-            PENDING.pop(
-                user_id,
-                None
-            )
+        if question_id and status == "added":
 
             await update.message.reply_text(
                 "Question successfully add हो गया।\n\n"
                 f"Question ID: {question_id}"
             )
 
+        elif question_id and status == "duplicate":
+
+            await update.message.reply_text(
+                "यह question पहले से database में मौजूद है।\n\n"
+                f"Existing Question ID: {question_id}"
+            )
+
         else:
 
             await update.message.reply_text(
-                "Question add नहीं हो सका। "
-                "Duplicate हो सकता है।"
+                "Question add नहीं हो सका।"
             )
 
         return
@@ -6425,19 +6497,23 @@ async def generate_command(update, context):
     added = 0
     duplicate = 0
     failed = 0
+    new_ids = []
 
     for question in questions:
 
         try:
 
-            question_id = add_question(
+            question_id, status = add_question(
                 question
             )
 
-            if question_id:
+            if question_id and status == "added":
                 added += 1
-            else:
+                new_ids.append(question_id)
+            elif question_id and status == "duplicate":
                 duplicate += 1
+            else:
+                failed += 1
 
         except Exception:
 
@@ -6447,13 +6523,35 @@ async def generate_command(update, context):
 
             failed += 1
 
+    summary_lines = [
+        "AI Generation Complete",
+        "",
+        f"Requested: {count}",
+        f"Generated: {len(questions)}",
+        f"Added: {added}",
+        f"Duplicate: {duplicate}",
+        f"Failed: {failed}",
+    ]
+
+    if new_ids:
+
+        quiz_id = create_quiz_from_question_ids(
+            user_id=update.effective_user.id,
+            title=f"AI: {topic}"[:100],
+            question_ids=new_ids,
+        )
+
+        if quiz_id:
+
+            summary_lines += [
+                "",
+                f"Quiz बन गया (Quiz ID: {quiz_id})",
+                f"Start करने के लिए:",
+                f"/quizid {quiz_id}",
+            ]
+
     await update.message.reply_text(
-        "AI Generation Complete\n\n"
-        f"Requested: {count}\n"
-        f"Generated: {len(questions)}\n"
-        f"Added: {added}\n"
-        f"Duplicate: {duplicate}\n"
-        f"Failed: {failed}"
+        "\n".join(summary_lines)
     )
 
 
@@ -6550,19 +6648,23 @@ async def scrape_command(update, context):
     added = 0
     duplicate = 0
     failed = 0
+    new_ids = []
 
     for question in result:
 
         try:
 
-            question_id = add_question(
+            question_id, status = add_question(
                 question
             )
 
-            if question_id:
+            if question_id and status == "added":
                 added += 1
-            else:
+                new_ids.append(question_id)
+            elif question_id and status == "duplicate":
                 duplicate += 1
+            else:
+                failed += 1
 
         except Exception:
 
@@ -6572,13 +6674,35 @@ async def scrape_command(update, context):
 
             failed += 1
 
+    summary_lines = [
+        "Scraping Complete",
+        "",
+        f"Source: {source_name}",
+        f"Generated: {len(result)}",
+        f"Added: {added}",
+        f"Duplicate: {duplicate}",
+        f"Failed: {failed}",
+    ]
+
+    if new_ids:
+
+        quiz_id = create_quiz_from_question_ids(
+            user_id=update.effective_user.id,
+            title=f"Source: {source_name}",
+            question_ids=new_ids,
+        )
+
+        if quiz_id:
+
+            summary_lines += [
+                "",
+                f"Quiz बन गया (Quiz ID: {quiz_id})",
+                f"Start करने के लिए:",
+                f"/quizid {quiz_id}",
+            ]
+
     await update.message.reply_text(
-        "Scraping Complete\n\n"
-        f"Source: {source_name}\n"
-        f"Generated: {len(result)}\n"
-        f"Added: {added}\n"
-        f"Duplicate: {duplicate}\n"
-        f"Failed: {failed}"
+        "\n".join(summary_lines)
     )
 
 
@@ -7224,13 +7348,40 @@ async def document_import_handler(
                 added + duplicate + failed
             )
 
+            new_ids = result.get(
+                "ids",
+                []
+            )
+
+            summary_lines = [
+                "PDF Import Complete",
+                "",
+                f"File: {filename}",
+                f"Total: {total}",
+                f"Added: {added}",
+                f"Duplicate: {duplicate}",
+                f"Failed: {failed}",
+            ]
+
+            if new_ids:
+
+                quiz_id = create_quiz_from_question_ids(
+                    user_id=user.id,
+                    title=f"PDF: {filename}",
+                    question_ids=new_ids,
+                )
+
+                if quiz_id:
+
+                    summary_lines += [
+                        "",
+                        f"Quiz बन गया (Quiz ID: {quiz_id})",
+                        f"Start करने के लिए:",
+                        f"/quizid {quiz_id}",
+                    ]
+
             await update.message.reply_text(
-                "PDF Import Complete\n\n"
-                f"File: {filename}\n"
-                f"Total: {total}\n"
-                f"Added: {added}\n"
-                f"Duplicate: {duplicate}\n"
-                f"Failed: {failed}"
+                "\n".join(summary_lines)
             )
 
         else:
@@ -7340,13 +7491,40 @@ async def document_import_handler(
                 added + duplicate + failed
             )
 
+            new_ids = result.get(
+                "ids",
+                []
+            )
+
+            summary_lines = [
+                "TXT Import Complete",
+                "",
+                f"File: {filename}",
+                f"Total: {total}",
+                f"Added: {added}",
+                f"Duplicate: {duplicate}",
+                f"Failed: {failed}",
+            ]
+
+            if new_ids:
+
+                quiz_id = create_quiz_from_question_ids(
+                    user_id=user.id,
+                    title=f"TXT: {filename}",
+                    question_ids=new_ids,
+                )
+
+                if quiz_id:
+
+                    summary_lines += [
+                        "",
+                        f"Quiz बन गया (Quiz ID: {quiz_id})",
+                        f"Start करने के लिए:",
+                        f"/quizid {quiz_id}",
+                    ]
+
             await update.message.reply_text(
-                "TXT Import Complete\n\n"
-                f"File: {filename}\n"
-                f"Total: {total}\n"
-                f"Added: {added}\n"
-                f"Duplicate: {duplicate}\n"
-                f"Failed: {failed}"
+                "\n".join(summary_lines)
             )
 
         else:
@@ -7434,11 +7612,11 @@ def save_poll_question(poll):
             "question_id": None,
         }
 
-    question_id = add_question(
+    question_id, status = add_question(
         payload
     )
 
-    if question_id:
+    if question_id and status == "added":
 
         return {
             "success": True,
@@ -7448,8 +7626,8 @@ def save_poll_question(poll):
 
     return {
         "success": False,
-        "reason": "duplicate",
-        "question_id": None,
+        "reason": status if question_id else "invalid",
+        "question_id": question_id,
     }
 
 
