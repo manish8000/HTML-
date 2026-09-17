@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import asyncio
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 from bs4 import BeautifulSoup
@@ -259,6 +259,40 @@ def db():
 
 
 # ============================================================
+# SAFE COLUMN MIGRATION HELPER
+# ============================================================
+
+def _add_column_if_missing(
+    conn,
+    table,
+    column,
+    coldef
+):
+
+    existing = {
+        row["name"]
+        for row in conn.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    }
+
+    if column in existing:
+        return
+
+    try:
+        conn.execute(
+            f"ALTER TABLE {table} "
+            f"ADD COLUMN {column} {coldef}"
+        )
+    except Exception:
+        logger.exception(
+            "Column migration failed: %s.%s",
+            table,
+            column
+        )
+
+
+# ============================================================
 # DATABASE INITIALIZATION
 # ============================================================
 
@@ -480,6 +514,65 @@ def init_db():
             );
 
 
+            CREATE TABLE IF NOT EXISTS bookmarks (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                user_id INTEGER NOT NULL,
+
+                question_id INTEGER NOT NULL,
+
+                created_at TEXT,
+
+                UNIQUE (
+                    user_id,
+                    question_id
+                ),
+
+                FOREIGN KEY(user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE,
+
+                FOREIGN KEY(question_id)
+                    REFERENCES questions(id)
+                    ON DELETE CASCADE
+
+            );
+
+
+            CREATE TABLE IF NOT EXISTS badges (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                user_id INTEGER NOT NULL,
+
+                badge_code TEXT NOT NULL,
+
+                earned_at TEXT,
+
+                UNIQUE (
+                    user_id,
+                    badge_code
+                )
+
+            );
+
+
+            CREATE TABLE IF NOT EXISTS feedback (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                user_id INTEGER,
+
+                question_id INTEGER,
+
+                message TEXT,
+
+                created_at TEXT
+
+            );
+
+
             CREATE INDEX IF NOT EXISTS idx_questions_active
             ON questions(active);
 
@@ -503,7 +596,45 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_quiz_questions_quiz
             ON quiz_questions(quiz_id);
 
+
+            CREATE INDEX IF NOT EXISTS idx_bookmarks_user
+            ON bookmarks(user_id);
+
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_user
+            ON feedback(user_id);
+
             """
+        )
+
+
+        # ------------------------------------------------------
+        # Column migrations (safe on existing databases)
+        # ------------------------------------------------------
+
+        _add_column_if_missing(
+            conn, "users", "current_streak",
+            "INTEGER DEFAULT 0"
+        )
+        _add_column_if_missing(
+            conn, "users", "max_streak",
+            "INTEGER DEFAULT 0"
+        )
+        _add_column_if_missing(
+            conn, "users", "last_quiz_date",
+            "TEXT"
+        )
+        _add_column_if_missing(
+            conn, "users", "referred_by",
+            "INTEGER"
+        )
+        _add_column_if_missing(
+            conn, "users", "referral_count",
+            "INTEGER DEFAULT 0"
+        )
+        _add_column_if_missing(
+            conn, "questions", "difficulty",
+            "TEXT DEFAULT 'medium'"
         )
 
 
@@ -1556,7 +1687,7 @@ def get_stats(
 
         conn.close()
 
-    return row
+    return dict(row) if row else None
 
 
 # ============================================================
@@ -1675,6 +1806,516 @@ def increment_quiz_count(
         conn.close()
 
     return True
+
+
+# ============================================================
+# STREAK SYSTEM
+# ============================================================
+
+def update_streak(
+    user_id
+):
+
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return None
+
+    today = datetime.now(
+        timezone.utc
+    ).date()
+
+    with DB_LOCK:
+
+        conn = db()
+
+        row = conn.execute(
+            """
+            SELECT current_streak,
+                   max_streak,
+                   last_quiz_date
+            FROM users
+            WHERE id = ?
+            """,
+            (user_id,)
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return None
+
+        current = row["current_streak"] or 0
+        best = row["max_streak"] or 0
+        last_date_str = row["last_quiz_date"]
+
+        if last_date_str:
+            try:
+                last_date = datetime.strptime(
+                    last_date_str,
+                    "%Y-%m-%d"
+                ).date()
+            except Exception:
+                last_date = None
+        else:
+            last_date = None
+
+        if last_date == today:
+            # Aaj already quiz ho chuka hai, streak same rahegi
+            conn.close()
+            return None
+
+        elif last_date == today - timedelta(days=1):
+            current += 1
+
+        else:
+            current = 1
+
+        best = max(best, current)
+
+        conn.execute(
+            """
+            UPDATE users
+            SET current_streak = ?,
+                max_streak = ?,
+                last_quiz_date = ?
+            WHERE id = ?
+            """,
+            (
+                current,
+                best,
+                today.isoformat(),
+                user_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    if current > 1:
+        return f"🔥 {current} दिन की streak जारी है!"
+
+    return None
+
+
+# ============================================================
+# ACHIEVEMENT BADGES
+# ============================================================
+
+BADGE_DEFINITIONS = {
+    "first_quiz": "पहला Quiz पूरा किया",
+    "100_questions": "100 Questions पूरे किए",
+    "500_questions": "500 Questions पूरे किए",
+    "streak_7": "7-दिन की Streak",
+    "streak_30": "30-दिन की Streak",
+    "score_90": "एक Quiz में 90%+ Accuracy",
+    "perfect_quiz": "100% Accuracy (Perfect Quiz)",
+}
+
+
+def award_badge(
+    user_id,
+    badge_code
+):
+
+    if badge_code not in BADGE_DEFINITIONS:
+        return False
+
+    conn = db()
+
+    try:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO badges
+            (
+                user_id,
+                badge_code,
+                earned_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                user_id,
+                badge_code,
+                utcnow(),
+            )
+        )
+
+        conn.commit()
+
+        return cur.rowcount > 0
+
+    except Exception:
+        logger.exception(
+            "Failed awarding badge"
+        )
+        return False
+
+    finally:
+        conn.close()
+
+
+def check_and_award_badges(
+    user_id,
+    total,
+    correct,
+    accuracy
+):
+
+    newly_awarded = []
+
+    stats = get_stats(user_id) or {}
+
+    answered = stats.get(
+        "questions_answered", 0
+    ) or 0
+
+    quizzes = stats.get(
+        "quizzes_completed", 0
+    ) or 0
+
+    streak = stats.get(
+        "current_streak", 0
+    ) or 0
+
+    checks = []
+
+    if quizzes >= 1:
+        checks.append("first_quiz")
+
+    if answered >= 100:
+        checks.append("100_questions")
+
+    if answered >= 500:
+        checks.append("500_questions")
+
+    if streak >= 7:
+        checks.append("streak_7")
+
+    if streak >= 30:
+        checks.append("streak_30")
+
+    if total and accuracy >= 90:
+        checks.append("score_90")
+
+    if total and correct == total:
+        checks.append("perfect_quiz")
+
+    for code in checks:
+        if award_badge(user_id, code):
+            newly_awarded.append(
+                BADGE_DEFINITIONS[code]
+            )
+
+    return newly_awarded
+
+
+def get_user_badges(
+    user_id
+):
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT badge_code, earned_at
+            FROM badges
+            WHERE user_id = ?
+            ORDER BY earned_at DESC
+            """,
+            (user_id,)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# BOOKMARKS
+# ============================================================
+
+def add_bookmark(
+    user_id,
+    question_id
+):
+
+    conn = db()
+
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO bookmarks
+            (
+                user_id,
+                question_id,
+                created_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                user_id,
+                question_id,
+                utcnow(),
+            )
+        )
+
+        conn.commit()
+        return True
+
+    except Exception:
+        logger.exception(
+            "Failed adding bookmark"
+        )
+        return False
+
+    finally:
+        conn.close()
+
+
+def remove_bookmark(
+    user_id,
+    question_id
+):
+
+    conn = db()
+
+    try:
+        conn.execute(
+            """
+            DELETE FROM bookmarks
+            WHERE user_id = ?
+            AND question_id = ?
+            """,
+            (user_id, question_id)
+        )
+
+        conn.commit()
+        return True
+
+    finally:
+        conn.close()
+
+
+def list_bookmarks(
+    user_id,
+    limit=10
+):
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT q.*
+            FROM bookmarks b
+            JOIN questions q
+                ON q.id = b.question_id
+            WHERE b.user_id = ?
+            ORDER BY b.created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# MISTAKE NOTEBOOK / WEAK TOPICS
+# ============================================================
+
+def list_mistakes(
+    user_id,
+    limit=10
+):
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT q.*
+            FROM quiz_history h
+            JOIN questions q
+                ON q.id = h.question_id
+            WHERE h.user_id = ?
+            AND h.correct = 0
+            AND h.selected_answer IS NOT NULL
+            ORDER BY h.answered_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    finally:
+        conn.close()
+
+
+def get_weak_topics(
+    user_id,
+    limit=5
+):
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                COALESCE(q.subject, 'General') AS subject,
+                COUNT(*) AS wrong_count
+            FROM quiz_history h
+            JOIN questions q
+                ON q.id = h.question_id
+            WHERE h.user_id = ?
+            AND h.correct = 0
+            AND h.selected_answer IS NOT NULL
+            GROUP BY subject
+            ORDER BY wrong_count DESC
+            LIMIT ?
+            """,
+            (user_id, limit)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# LEADERBOARD
+# ============================================================
+
+def get_leaderboard(
+    limit=10
+):
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, username, first_name, score,
+                   correct_answers, questions_answered
+            FROM users
+            WHERE questions_answered > 0
+            ORDER BY score DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+        return [dict(r) for r in rows]
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# FEEDBACK / REPORT
+# ============================================================
+
+def add_feedback(
+    user_id,
+    question_id,
+    message="Reported via button"
+):
+
+    conn = db()
+
+    try:
+        conn.execute(
+            """
+            INSERT INTO feedback
+            (
+                user_id,
+                question_id,
+                message,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                question_id,
+                message,
+                utcnow(),
+            )
+        )
+
+        conn.commit()
+        return True
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# REFERRAL SYSTEM
+# ============================================================
+
+def set_referrer(
+    user_id,
+    referrer_id
+):
+
+    if user_id == referrer_id:
+        return False
+
+    conn = db()
+
+    try:
+        row = conn.execute(
+            """
+            SELECT referred_by
+            FROM users
+            WHERE id = ?
+            """,
+            (user_id,)
+        ).fetchone()
+
+        if not row or row["referred_by"]:
+            # पहले से referred है, या user मौजूद नहीं
+            return False
+
+        conn.execute(
+            """
+            UPDATE users
+            SET referred_by = ?
+            WHERE id = ?
+            """,
+            (referrer_id, user_id)
+        )
+
+        conn.execute(
+            """
+            UPDATE users
+            SET referral_count =
+                    COALESCE(referral_count, 0) + 1
+            WHERE id = ?
+            """,
+            (referrer_id,)
+        )
+
+        conn.commit()
+        return True
+
+    except Exception:
+        logger.exception(
+            "Failed setting referrer"
+        )
+        return False
+
+    finally:
+        conn.close()
 
 
 # ============================================================
@@ -2788,7 +3429,10 @@ def get_quiz_questions(
 
 def mark_question_used(
     user_id,
-    question_id
+    question_id,
+    selected_answer=None,
+    correct=None,
+    score_delta=0
 ):
 
     conn = db()
@@ -2797,17 +3441,30 @@ def mark_question_used(
 
         conn.execute(
             """
-            INSERT OR IGNORE INTO quiz_history
+            INSERT INTO quiz_history
             (
                 user_id,
                 question_id,
+                selected_answer,
+                correct,
+                score,
                 answered_at
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
+
+            ON CONFLICT(user_id, question_id)
+            DO UPDATE SET
+                selected_answer = excluded.selected_answer,
+                correct = excluded.correct,
+                score = excluded.score,
+                answered_at = excluded.answered_at
             """,
             (
                 user_id,
                 question_id,
+                selected_answer,
+                1 if correct else 0,
+                float(score_delta),
                 utcnow(),
             )
         )
@@ -3411,6 +4068,16 @@ async def send_quiz_question(
             [
                 [
                     InlineKeyboardButton(
+                        "🔖 Save",
+                        callback_data=f"bm:{question['id']}"
+                    ),
+                    InlineKeyboardButton(
+                        "⚠️ Report",
+                        callback_data=f"fb:{question['id']}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
                         "Stop Quiz",
                         callback_data=f"stopquiz:{session_id}"
                     )
@@ -3593,6 +4260,23 @@ async def send_scorecard(
         if total else 0
     )
 
+    user_id = session["user_id"]
+
+    increment_quiz_count(
+        user_id
+    )
+
+    streak_text = update_streak(
+        user_id
+    )
+
+    new_badges = check_and_award_badges(
+        user_id,
+        total=total,
+        correct=correct,
+        accuracy=accuracy
+    )
+
     text = (
         "🏆 Quiz पूरा हो गया!\n\n"
         f"कुल प्रश्न: {total}\n"
@@ -3602,6 +4286,17 @@ async def send_scorecard(
         f"Accuracy: {accuracy:.1f}%\n"
         f"स्कोर: {score:.2f}"
     )
+
+    if streak_text:
+        text += f"\n\n{streak_text}"
+
+    if new_badges:
+        text += (
+            "\n\n🏅 नया Badge मिला:\n"
+            + "\n".join(
+                f"• {b}" for b in new_badges
+            )
+        )
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -3871,13 +4566,21 @@ async def poll_answer_handler(
 
     mark_question_used(
         session["user_id"],
-        question_id
+        question_id,
+        selected_answer=selected,
+        correct=(selected == correct_answer),
     )
 
     if selected == correct_answer:
 
         session["correct"] += 1
         session["score"] += 1
+
+        update_user_stats(
+            session["user_id"],
+            correct=True,
+            score_delta=1
+        )
 
         result_text = "🎉 सही उत्तर! बधाई हो।"
 
@@ -3888,6 +4591,12 @@ async def poll_answer_handler(
         negative_mark = get_negative_mark()
 
         session["score"] -= negative_mark
+
+        update_user_stats(
+            session["user_id"],
+            correct=False,
+            score_delta=-negative_mark
+        )
 
         result_text = (
             "❌ गलत उत्तर।\n"
@@ -4007,6 +4716,88 @@ async def stop_quiz_callback(
     )
 
 
+# ============================================================
+# BOOKMARK CALLBACK
+# ============================================================
+
+async def bookmark_callback(
+    update,
+    context
+):
+
+    query = update.callback_query
+
+    data = query.data or ""
+
+    parts = data.split(":")
+
+    if len(parts) != 2:
+        await query.answer()
+        return
+
+    try:
+        question_id = int(parts[1])
+    except Exception:
+        await query.answer()
+        return
+
+    user_id = query.from_user.id
+
+    ensure_user(query.from_user)
+
+    added = add_bookmark(
+        user_id,
+        question_id
+    )
+
+    await query.answer(
+        "🔖 Question save हो गया। /mybookmarks से देखें।"
+        if added else
+        "यह question पहले से saved है।",
+        show_alert=False
+    )
+
+
+# ============================================================
+# FEEDBACK / REPORT CALLBACK
+# ============================================================
+
+async def feedback_callback(
+    update,
+    context
+):
+
+    query = update.callback_query
+
+    data = query.data or ""
+
+    parts = data.split(":")
+
+    if len(parts) != 2:
+        await query.answer()
+        return
+
+    try:
+        question_id = int(parts[1])
+    except Exception:
+        await query.answer()
+        return
+
+    user_id = query.from_user.id
+
+    ensure_user(query.from_user)
+
+    add_feedback(
+        user_id,
+        question_id
+    )
+
+    await query.answer(
+        "⚠️ Report दर्ज हो गई। धन्यवाद!",
+        show_alert=True
+    )
+
+
     # ============================================================
 # START COMMAND
 # ============================================================
@@ -4021,8 +4812,21 @@ async def start_command(
     
     ensure_user(user)
 
+    # Referral link handling: /start ref_<user_id>
+    args = context.args
 
+    if args and args[0].startswith("ref_"):
 
+        try:
+            referrer_id = int(
+                args[0][4:]
+            )
+            set_referrer(
+                user.id,
+                referrer_id
+            )
+        except Exception:
+            pass
 
     admin_text = ""
 
@@ -4038,6 +4842,13 @@ async def start_command(
         "/stats - अपनी stats देखें\n"
         "/newquiz - नया quiz बनाएं\n"
         "/quizid ID - Saved quiz शुरू करें\n"
+        "/dashboard - Detailed dashboard देखें\n"
+        "/leaderboard - Top users देखें\n"
+        "/mybookmarks - Saved questions देखें\n"
+        "/mymistakes - गलत questions दोबारा देखें\n"
+        "/revision - सिर्फ गलत questions से quiz\n"
+        "/weaktopics - अपने weak topics जानें\n"
+        "/myreferrals - अपना referral link पाएं\n"
         "/help - सभी commands देखें"
         + admin_text
     )
@@ -4070,13 +4881,423 @@ async def stats_command(
         )
         return
 
+    answered = stats.get("questions_answered", 0) or 0
+    correct = stats.get("correct_answers", 0) or 0
+    wrong = stats.get("wrong_answers", 0) or 0
+    score = stats.get("score", 0) or 0
+    quizzes = stats.get("quizzes_completed", 0) or 0
+    streak = stats.get("current_streak", 0) or 0
+    max_streak = stats.get("max_streak", 0) or 0
+
+    accuracy = (
+        (correct / answered) * 100
+        if answered else 0
+    )
+
     await update.message.reply_text(
         "आपकी Quiz Stats\n\n"
-        f"कुल Quiz: {stats.get('quiz_count', 0)}\n"
-        f"कुल Questions: {stats.get('total_questions', 0)}\n"
-        f"सही: {stats.get('correct', 0)}\n"
-        f"गलत: {stats.get('wrong', 0)}\n"
-        f"स्कोर: {stats.get('score', 0)}"
+        f"कुल Quiz: {quizzes}\n"
+        f"कुल Questions: {answered}\n"
+        f"सही: {correct}\n"
+        f"गलत: {wrong}\n"
+        f"Accuracy: {accuracy:.1f}%\n"
+        f"स्कोर: {score:.2f}\n"
+        f"🔥 Streak: {streak} दिन (सबसे लंबा: {max_streak})"
+    )
+
+
+# ============================================================
+# MY BOOKMARKS
+# ============================================================
+
+async def mybookmarks_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    rows = list_bookmarks(
+        user.id,
+        limit=10
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "आपने अभी तक कोई question save नहीं किया।\n\n"
+            "Quiz खेलते समय 🔖 Save button दबाकर "
+            "questions save कर सकते हैं।"
+        )
+        return
+
+    lines = ["🔖 आपके Saved Questions:\n"]
+
+    for i, q in enumerate(rows, 1):
+        lines.append(
+            f"{i}. {q['question'][:80]}\n"
+            f"   उत्तर: {q['answer']}"
+        )
+
+    await update.message.reply_text(
+        "\n\n".join(lines)
+    )
+
+
+# ============================================================
+# MY MISTAKES
+# ============================================================
+
+async def mymistakes_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    rows = list_mistakes(
+        user.id,
+        limit=10
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "आपकी mistake notebook खाली है। बढ़िया! 🎉"
+        )
+        return
+
+    lines = ["📓 आपकी Mistake Notebook:\n"]
+
+    for i, q in enumerate(rows, 1):
+        lines.append(
+            f"{i}. {q['question'][:80]}\n"
+            f"   सही उत्तर: {q['answer']}"
+        )
+
+    lines.append(
+        "\n\n/revision भेजकर इन्हीं questions से "
+        "quiz शुरू करें।"
+    )
+
+    await update.message.reply_text(
+        "\n\n".join(lines)
+    )
+
+
+# ============================================================
+# WEAK TOPICS
+# ============================================================
+
+async def weaktopics_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    rows = get_weak_topics(
+        user.id,
+        limit=5
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "अभी तक कोई weak topic नहीं मिला। "
+            "थोड़े और quiz खेलिए।"
+        )
+        return
+
+    lines = ["📊 आपके Weak Topics:\n"]
+
+    for i, r in enumerate(rows, 1):
+        lines.append(
+            f"{i}. {r['subject']} — "
+            f"{r['wrong_count']} गलत"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# REVISION MODE
+# ============================================================
+
+async def revision_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    rows = list_mistakes(
+        user.id,
+        limit=50
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "आपकी mistake notebook खाली है, "
+            "revision के लिए कोई question नहीं है।"
+        )
+        return
+
+    questions = [
+        dict(r) for r in rows
+    ]
+
+    session_id = create_quiz_session(
+        user_id=user.id,
+        questions=questions
+    )
+
+    await update.message.reply_text(
+        f"📓 Revision Quiz शुरू हो रहा है "
+        f"({len(questions)} questions)..."
+    )
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id
+    )
+
+
+# ============================================================
+# LEADERBOARD
+# ============================================================
+
+async def leaderboard_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    rows = get_leaderboard(
+        limit=10
+    )
+
+    if not rows:
+        await update.message.reply_text(
+            "अभी तक leaderboard खाली है।"
+        )
+        return
+
+    lines = ["🏆 Top 10 Leaderboard:\n"]
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for i, r in enumerate(rows, 1):
+        name = (
+            r.get("first_name")
+            or r.get("username")
+            or f"User {r['id']}"
+        )
+
+        prefix = (
+            medals[i - 1]
+            if i <= 3 else f"{i}."
+        )
+
+        lines.append(
+            f"{prefix} {name} — "
+            f"Score: {r['score']:.1f} "
+            f"({r['correct_answers']} सही)"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# PERSONAL DASHBOARD
+# ============================================================
+
+async def dashboard_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    stats = get_stats(user.id)
+
+    if not stats:
+        await update.message.reply_text(
+            "अभी आपका कोई data उपलब्ध नहीं है।"
+        )
+        return
+
+    answered = stats.get(
+        "questions_answered", 0
+    ) or 0
+
+    correct = stats.get(
+        "correct_answers", 0
+    ) or 0
+
+    wrong = stats.get(
+        "wrong_answers", 0
+    ) or 0
+
+    score = stats.get("score", 0) or 0
+
+    quizzes = stats.get(
+        "quizzes_completed", 0
+    ) or 0
+
+    streak = stats.get(
+        "current_streak", 0
+    ) or 0
+
+    max_streak = stats.get(
+        "max_streak", 0
+    ) or 0
+
+    referrals = stats.get(
+        "referral_count", 0
+    ) or 0
+
+    accuracy = (
+        (correct / answered) * 100
+        if answered else 0
+    )
+
+    badges = get_user_badges(user.id)
+
+    weak = get_weak_topics(
+        user.id,
+        limit=3
+    )
+
+    text = (
+        "📊 आपका Dashboard\n\n"
+        f"कुल Quiz: {quizzes}\n"
+        f"कुल Questions: {answered}\n"
+        f"सही: {correct} | गलत: {wrong}\n"
+        f"Accuracy: {accuracy:.1f}%\n"
+        f"स्कोर: {score:.2f}\n"
+        f"🔥 Streak: {streak} दिन "
+        f"(सबसे लंबा: {max_streak})\n"
+        f"👥 Referrals: {referrals}\n"
+        f"🏅 Badges: {len(badges)}"
+    )
+
+    if weak:
+        text += "\n\nWeak Topics:\n" + "\n".join(
+            f"• {w['subject']} ({w['wrong_count']} गलत)"
+            for w in weak
+        )
+
+    await update.message.reply_text(text)
+
+
+# ============================================================
+# MY REFERRALS
+# ============================================================
+
+async def myreferrals_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    stats = get_stats(user.id) or {}
+
+    referrals = stats.get(
+        "referral_count", 0
+    ) or 0
+
+    bot_username = context.bot.username
+
+    link = (
+        f"https://t.me/{bot_username}"
+        f"?start=ref_{user.id}"
+        if bot_username else
+        f"(bot username पता नहीं चला, "
+        f"आपकी referral id: {user.id})"
+    )
+
+    await update.message.reply_text(
+        "👥 Referral Program\n\n"
+        f"अभी तक आपने {referrals} लोगों को invite किया है।\n\n"
+        f"अपना referral link शेयर करें:\n{link}"
+    )
+
+
+# ============================================================
+# EXAM MODE
+# ============================================================
+
+async def exam_command(
+    update,
+    context
+):
+
+    user = update.effective_user
+
+    ensure_user(user)
+
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "किस exam का mock test चाहिए?\n\n"
+            "उदाहरण: /exam RAS"
+        )
+        return
+
+    exam_name = " ".join(args)
+
+    count = min(
+        50,
+        MAX_IMPORT_QUESTIONS
+    )
+
+    questions = get_quiz_questions(
+        user_id=user.id,
+        count=count,
+        exam=exam_name
+    )
+
+    if not questions:
+        await update.message.reply_text(
+            f"'{exam_name}' exam के लिए कोई "
+            f"unseen questions उपलब्ध नहीं हैं।"
+        )
+        return
+
+    session_id = create_quiz_session(
+        user_id=user.id,
+        questions=questions
+    )
+
+    await update.message.reply_text(
+        f"📝 {exam_name} Mock Test शुरू हो रहा है "
+        f"({len(questions)} questions)..."
+    )
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id
     )
 
 
@@ -4105,6 +5326,30 @@ Random quiz शुरू करें
 
 /stats
 अपनी performance देखें
+
+/dashboard
+पूरा dashboard देखें (streak, badges, weak topics)
+
+/leaderboard
+Top 10 users देखें
+
+/mybookmarks
+Saved (🔖) questions देखें
+
+/mymistakes
+गलत किए गए questions देखें
+
+/revision
+सिर्फ गलत questions से quiz
+
+/weaktopics
+अपने कमज़ोर topics जानें
+
+/exam NAME
+उस exam का mock test
+
+/myreferrals
+अपना referral link पाएं
 
 /quizid ID
 Saved quiz शुरू करें
@@ -7697,6 +8942,66 @@ def build_application():
     )
 
     # ========================================================
+    # NEW FEATURES - BOOKMARKS / MISTAKES / LEADERBOARD / ETC
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "mybookmarks",
+            mybookmarks_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "mymistakes",
+            mymistakes_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "weaktopics",
+            weaktopics_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "revision",
+            revision_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "leaderboard",
+            leaderboard_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "dashboard",
+            dashboard_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "myreferrals",
+            myreferrals_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "exam",
+            exam_command
+        )
+    )
+
+    # ========================================================
     # ADMIN - QUESTION MANAGEMENT
     # ========================================================
 
@@ -7945,6 +9250,20 @@ def build_application():
         CallbackQueryHandler(
             stop_quiz_callback,
             pattern=r"^stopquiz:"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            bookmark_callback,
+            pattern=r"^bm:"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            feedback_callback,
+            pattern=r"^fb:"
         )
     )
     # ========================================================
