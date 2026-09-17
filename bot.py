@@ -2435,17 +2435,17 @@ def save_pdf_file(
             """
             INSERT INTO pdf_files
             (
-                user_id,
-                file_name,
-                file_path,
+                filename,
+                path,
+                imported_by,
                 created_at
             )
             VALUES (?, ?, ?, ?)
             """,
             (
-                user_id,
                 file_name,
                 str(file_path),
+                user_id,
                 utcnow(),
             )
         )
@@ -2801,7 +2801,7 @@ def mark_question_used(
             (
                 user_id,
                 question_id,
-                used_at
+                answered_at
             )
             VALUES (?, ?, ?)
             """,
@@ -4928,6 +4928,46 @@ async def resetquiztime_command(
 
 
 # ============================================================
+# RESET USER QUIZ HISTORY
+# ============================================================
+
+async def resethistory_command(
+    update,
+    context
+):
+
+    if not await require_admin(update):
+        return
+
+    if context.args:
+
+        try:
+            target_id = int(context.args[0])
+        except Exception:
+
+            await update.message.reply_text(
+                "Invalid user id.\n\n"
+                "Usage:\n"
+                "/resethistory (अपने लिए)\n"
+                "/resethistory USER_ID (किसी और के लिए)"
+            )
+
+            return
+
+    else:
+        target_id = update.effective_user.id
+
+    reset_user_history(
+        target_id
+    )
+
+    await update.message.reply_text(
+        f"Quiz history reset कर दी गई (user: {target_id})।\n\n"
+        "अब सभी questions दोबारा उपलब्ध हैं।"
+    )
+
+
+# ============================================================
 # STOP COMMAND
 # ============================================================
 
@@ -5656,6 +5696,132 @@ async def pdfinfo_command(update, context):
     await update.message.reply_text(
         "\n".join(lines)
     )
+
+
+# ============================================================
+# CHANNEL AUTO PDF IMPORT
+#
+# Configured CHANNEL_ID में जो भी नई PDF post होगी,
+# उसे अपने आप download करके questions generate कर देगा।
+# ============================================================
+
+async def channel_pdf_handler(
+    update,
+    context
+):
+
+    message = (
+        update.channel_post
+        or update.edited_channel_post
+    )
+
+    if not message:
+        return
+
+    if not CHANNEL_ID:
+        return
+
+    try:
+        configured_id = int(CHANNEL_ID)
+    except Exception:
+        configured_id = None
+
+    chat_id = message.chat_id
+
+    channel_matches = (
+        configured_id is not None
+        and chat_id == configured_id
+    ) or (
+        message.chat.username
+        and message.chat.username.lower()
+        == CHANNEL_ID.lstrip("@").lower()
+    )
+
+    if not channel_matches:
+        return
+
+    document = message.document
+
+    if not document:
+        return
+
+    filename = (
+        document.file_name
+        or "unknown.pdf"
+    )
+
+    extension = (
+        Path(filename)
+        .suffix
+        .lower()
+    )
+
+    if extension != ".pdf":
+        return
+
+    logger.info(
+        "Channel PDF detected: %s",
+        filename
+    )
+
+    try:
+
+        telegram_file = await context.bot.get_file(
+            document.file_id
+        )
+
+        safe_name = (
+            f"{uuid.uuid4().hex}_"
+            f"{Path(filename).name}"
+        )
+
+        destination = (
+            PDF_DIR / safe_name
+        )
+
+        await telegram_file.download_to_drive(
+            custom_path=str(destination)
+        )
+
+        saved_ids = import_pdf(
+            user_id=0,
+            file_path=str(destination),
+            file_name=filename,
+        )
+
+        added = len(saved_ids)
+
+        summary = (
+            "📥 Channel PDF Auto-Import\n\n"
+            f"File: {filename}\n"
+            f"Questions added: {added}"
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Channel PDF auto-import failed"
+        )
+
+        summary = (
+            "📥 Channel PDF Auto-Import Failed\n\n"
+            f"File: {filename}"
+        )
+
+    for admin_id in ADMIN_IDS:
+
+        try:
+
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=summary
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed notifying admin %s",
+                admin_id
+            )
 
 
 # ============================================================
@@ -7640,6 +7806,17 @@ def build_application():
         )
     )
 
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL
+            & (
+                filters.UpdateType.CHANNEL_POST
+                | filters.UpdateType.EDITED_CHANNEL_POST
+            ),
+            channel_pdf_handler
+        )
+    )
+
     # ========================================================
     # POLL
     # ========================================================
@@ -7726,6 +7903,13 @@ def build_application():
         CommandHandler(
             "resetquiztime",
             resetquiztime_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resethistory",
+            resethistory_command
         )
     )
 
