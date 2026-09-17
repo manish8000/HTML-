@@ -1367,10 +1367,8 @@ def get_quiz_questions(
     except Exception:
         count = DEFAULT_QUIZ_COUNT
 
-    count = max(
-        1,
-        min(count, MAX_IMPORT_QUESTIONS)
-    )
+    # Quiz question count अब unlimited है - सिर्फ न्यूनतम 1 जरूरी है
+    count = max(1, count)
 
     with DB_LOCK:
 
@@ -3044,6 +3042,44 @@ def extract_txt_text(file_path):
         return ""
 
 
+def extract_html_text(file_path):
+
+    try:
+
+        raw = extract_txt_text(
+            file_path
+        )
+
+        if not raw.strip():
+            return ""
+
+        soup = BeautifulSoup(
+            raw,
+            "html.parser"
+        )
+
+        text = soup.get_text(
+            separator="\n"
+        )
+
+        lines = [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip()
+        ]
+
+        return "\n".join(lines)
+
+    except Exception:
+
+        logger.exception(
+            "HTML extraction failed: %s",
+            file_path
+        )
+
+        return ""
+
+
 # ============================================================
 # SAVE PDF FILE RECORD
 # ============================================================
@@ -3247,6 +3283,38 @@ def import_txt(
 ):
 
     text = extract_txt_text(
+        file_path
+    )
+
+    empty_result = {
+        "ids": [],
+        "added": 0,
+        "duplicate": 0,
+        "failed": 0,
+        "total": 0,
+    }
+
+    if not text.strip():
+        return empty_result
+
+    return import_questions_from_text(
+        text=text,
+        source=file_name,
+        count=count,
+    )
+
+
+# ============================================================
+# IMPORT HTML
+# ============================================================
+
+def import_html(
+    file_path,
+    file_name,
+    count=None
+):
+
+    text = extract_html_text(
         file_path
     )
 
@@ -4411,13 +4479,8 @@ async def quiz_command(
             except Exception:
                 time_limit = None
 
-    count = max(
-        1,
-        min(
-            count,
-            MAX_IMPORT_QUESTIONS
-        )
-    )
+    # Quiz question count अब unlimited है - सिर्फ न्यूनतम 1 जरूरी है
+    count = max(1, count)
 
     questions = get_quiz_questions(
         user_id=user.id,
@@ -4525,7 +4588,7 @@ async def quizid_command(
     questions = get_unseen_saved_quiz_questions(
         user_id=user.id,
         quiz_id=quiz_id,
-        count=MAX_IMPORT_QUESTIONS
+        count=10_000_000
     )
 
     if not questions:
@@ -5717,6 +5780,142 @@ async def pending_text_handler(
     if not text:
         return
 
+    # --------------------------------------------------------
+    # AUTO QUIZ (PDF/TXT/HTML भेजने के बाद questions की संख्या)
+    # --------------------------------------------------------
+
+    if pending.get("action") == "auto_quiz_count":
+
+        try:
+            count = int(text)
+        except Exception:
+            await update.message.reply_text(
+                "कृपया केवल number भेजें।\n"
+                "Example: 10"
+            )
+            return
+
+        if count < 1:
+            await update.message.reply_text(
+                "Questions की संख्या कम से कम 1 होनी चाहिए।"
+            )
+            return
+
+        file_path = pending.get("file_path")
+        filename = pending.get("filename") or "file"
+        extension = pending.get("extension")
+
+        PENDING.pop(
+            user_id,
+            None
+        )
+
+        await update.message.reply_text(
+            "File process हो रही है और Quiz तैयार किया जा रहा है...\n"
+            "कृपया प्रतीक्षा करें।"
+        )
+
+        try:
+
+            if extension == ".pdf":
+
+                result = import_pdf(
+                    user_id=user_id,
+                    file_path=file_path,
+                    file_name=filename,
+                    count=count,
+                )
+
+            elif extension in (".html", ".htm"):
+
+                result = import_html(
+                    file_path=file_path,
+                    file_name=filename,
+                    count=count,
+                )
+
+            else:
+
+                result = import_txt(
+                    file_path=file_path,
+                    file_name=filename,
+                    count=count,
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Auto quiz import failed"
+            )
+
+            await update.message.reply_text(
+                "File process करते समय error आया।"
+            )
+
+            return
+
+        finally:
+
+            try:
+                Path(file_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        new_ids = (
+            result.get("ids", [])
+            if isinstance(result, dict)
+            else []
+        )
+
+        if not new_ids:
+
+            await update.message.reply_text(
+                "File से कोई भी question नहीं बन सका। "
+                "कृपया दूसरी file try करें।"
+            )
+
+            return
+
+        quiz_id = create_quiz_from_question_ids(
+            user_id=user_id,
+            title=f"Auto: {filename}",
+            question_ids=new_ids,
+        )
+
+        if not quiz_id:
+
+            await update.message.reply_text(
+                "Quiz create नहीं हो सका।"
+            )
+
+            return
+
+        quiz_questions = get_saved_quiz_questions(
+            quiz_id
+        )
+
+        if not quiz_questions:
+
+            await update.message.reply_text(
+                "Quiz में कोई questions नहीं मिले।"
+            )
+
+            return
+
+        session_id = create_quiz_session(
+            user_id=user_id,
+            questions=quiz_questions,
+            quiz_id=quiz_id,
+        )
+
+        await send_quiz_question(
+            context,
+            update.effective_chat.id,
+            session_id
+        )
+
+        return
+
     data = parse_question_text(
         text
     )
@@ -6015,11 +6214,7 @@ async def newquiz_text_handler(
 
             return
 
-        count = min(
-            count,
-            MAX_IMPORT_QUESTIONS
-        )
-
+        # Quiz question count अब unlimited है - सिर्फ न्यूनतम 1 जरूरी है
         state["count"] = count
 
         title = state["title"]
@@ -7244,16 +7439,50 @@ async def document_import_handler(
 
         if extension in (
             ".pdf",
-            ".txt"
+            ".txt",
+            ".html",
+            ".htm",
         ):
 
+            try:
+
+                temp_path = (
+                    DATA_DIR
+                    / f"{uuid.uuid4().hex}{extension}"
+                )
+
+                telegram_file = await context.bot.get_file(
+                    document.file_id
+                )
+
+                await telegram_file.download_to_drive(
+                    custom_path=str(temp_path)
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Auto quiz file download failed"
+                )
+
+                await update.message.reply_text(
+                    "File download करते समय error आया।"
+                )
+
+                return
+
+            PENDING[user.id] = {
+                "action": "auto_quiz_count",
+                "file_path": str(temp_path),
+                "filename": filename,
+                "extension": extension,
+            }
+
             await update.message.reply_text(
-                "File receive हुई है लेकिन कोई import operation "
-                "select नहीं किया गया।\n\n"
-                "PDF के लिए पहले:\n"
-                "/pdfimport\n\n"
-                "TXT के लिए:\n"
-                "/txtimport"
+                "File मिल गई।\n\n"
+                "कितने questions बनाने हैं? सिर्फ number भेजें।\n"
+                "Example: 10\n\n"
+                "Cancel: /cancel"
             )
 
         return
