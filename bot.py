@@ -3371,7 +3371,7 @@ def get_quiz_questions(
         if exam:
 
             conditions.append(
-                "q.exam = ?"
+                "LOWER(TRIM(COALESCE(q.exam, ''))) = LOWER(TRIM(?))"
             )
 
             params.append(exam)
@@ -3379,7 +3379,7 @@ def get_quiz_questions(
         if subject:
 
             conditions.append(
-                "q.subject = ?"
+                "LOWER(TRIM(COALESCE(q.subject, ''))) = LOWER(TRIM(?))"
             )
 
             params.append(subject)
@@ -3551,7 +3551,7 @@ def get_unseen_question_count(
         if exam:
 
             conditions.append(
-                "q.exam = ?"
+                "LOWER(TRIM(COALESCE(q.exam, ''))) = LOWER(TRIM(?))"
             )
 
             params.append(exam)
@@ -3559,7 +3559,7 @@ def get_unseen_question_count(
         if subject:
 
             conditions.append(
-                "q.subject = ?"
+                "LOWER(TRIM(COALESCE(q.subject, ''))) = LOWER(TRIM(?))"
             )
 
             params.append(subject)
