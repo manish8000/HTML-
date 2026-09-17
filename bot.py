@@ -142,9 +142,12 @@ logging.basicConfig(
     )
 )
 
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 logger = logging.getLogger(
     "quizbot"
 )
+
 
 
 # ============================================================
