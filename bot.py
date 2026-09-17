@@ -26,6 +26,7 @@ from groq import Groq
 
 from telegram import (
     Update,
+    Poll,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
@@ -34,11 +35,11 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    PollAnswerHandler,
     ContextTypes,
     TypeHandler,
     filters,
 )
-
 
 # ============================================================
 # CONFIG
@@ -108,7 +109,16 @@ DEFAULT_NEGATIVE_MARK = float(
 )
 
 MAX_IMPORT_QUESTIONS = int(
+DEFAULT_QUIZ_TIME_SECONDS = int(
     os.getenv(
+        "QUIZ_TIME_SECONDS",
+        "30"
+    )
+)
+
+MIN_QUIZ_TIME_SECONDS = 5
+
+MAX_QUIZ_TIME_SECONDS = 600    os.getenv(
         "MAX_IMPORT_QUESTIONS",
         "500"
     )
@@ -141,6 +151,8 @@ logger = logging.getLogger(
 DB_LOCK = threading.RLock()
 
 ACTIVE_QUIZZES = {}
+
+ACTIVE_POLLS = {}
 
 PENDING = {}
 
@@ -615,7 +627,36 @@ def set_setting(
 
 
 def get_negative_mark():
+def clamp_quiz_time(seconds):
 
+    try:
+        seconds = int(seconds)
+    except Exception:
+        seconds = DEFAULT_QUIZ_TIME_SECONDS
+
+    return max(
+        MIN_QUIZ_TIME_SECONDS,
+        min(
+            seconds,
+            MAX_QUIZ_TIME_SECONDS
+        )
+    )
+
+
+def get_quiz_time():
+
+    value = get_setting(
+        "quiz_time_seconds",
+        DEFAULT_QUIZ_TIME_SECONDS
+    )
+
+    try:
+        seconds = int(float(value))
+
+    except Exception:
+        seconds = DEFAULT_QUIZ_TIME_SECONDS
+
+    return clamp_quiz_time(seconds)
     value = get_setting(
         "negative_mark",
         DEFAULT_NEGATIVE_MARK
