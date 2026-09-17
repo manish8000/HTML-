@@ -41,6 +41,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -109,6 +110,12 @@ DEFAULT_NEGATIVE_MARK = float(
 )
 
 MAX_IMPORT_QUESTIONS = int(
+    os.getenv(
+        "MAX_IMPORT_QUESTIONS",
+        "500"
+    )
+)
+
 DEFAULT_QUIZ_TIME_SECONDS = int(
     os.getenv(
         "QUIZ_TIME_SECONDS",
@@ -118,11 +125,7 @@ DEFAULT_QUIZ_TIME_SECONDS = int(
 
 MIN_QUIZ_TIME_SECONDS = 5
 
-MAX_QUIZ_TIME_SECONDS = 600    os.getenv(
-        "MAX_IMPORT_QUESTIONS",
-        "500"
-    )
-)
+MAX_QUIZ_TIME_SECONDS = 600
 
 
 # ============================================================
@@ -627,6 +630,19 @@ def set_setting(
 
 
 def get_negative_mark():
+
+    value = get_setting(
+        "negative_mark",
+        DEFAULT_NEGATIVE_MARK
+    )
+
+    try:
+        return float(value)
+
+    except Exception:
+        return DEFAULT_NEGATIVE_MARK
+
+
 def clamp_quiz_time(seconds):
 
     try:
@@ -657,16 +673,6 @@ def get_quiz_time():
         seconds = DEFAULT_QUIZ_TIME_SECONDS
 
     return clamp_quiz_time(seconds)
-    value = get_setting(
-        "negative_mark",
-        DEFAULT_NEGATIVE_MARK
-    )
-
-    try:
-        return float(value)
-
-    except Exception:
-        return DEFAULT_NEGATIVE_MARK
 
 
 # ============================================================
@@ -3223,7 +3229,8 @@ def create_random_quiz(
 def create_quiz_session(
     user_id,
     questions,
-    quiz_id=None
+    quiz_id=None,
+    time_limit=None
 ):
 
     session_id = uuid.uuid4().hex[:12]
@@ -3241,6 +3248,10 @@ def create_quiz_session(
         "skipped": 0,
         "started_at": time.time(),
         "answered": set(),
+        "time_limit": clamp_quiz_time(
+            time_limit or get_quiz_time()
+        ),
+        "current_poll_id": None,
     }
 
     return session_id
@@ -3308,9 +3319,12 @@ def get_current_question(
 # QUIZ DISPLAY
 # ============================================================
 
+ANSWER_LETTERS = ["A", "B", "C", "D"]
+
+
 async def send_quiz_question(
-    update,
     context,
+    chat_id,
     session_id
 ):
 
@@ -3327,13 +3341,10 @@ async def send_quiz_question(
 
     if not question:
 
-        user_id = session["user_id"]
-
-        await update.effective_message.reply_text(
-            "Quiz पूरा हो गया।\n\n"
-            f"सही: {session['correct']}\n"
-            f"गलत: {session['wrong']}\n"
-            f"स्कोर: {session['score']}"
+        await send_scorecard(
+            context,
+            chat_id,
+            session
         )
 
         remove_quiz_session(
@@ -3345,49 +3356,256 @@ async def send_quiz_question(
     index = session["index"] + 1
     total = len(session["questions"])
 
-    text = (
-        f"प्रश्न {index}/{total}\n\n"
-        f"{question['question']}\n\n"
-        f"A) {question['option_a']}\n"
-        f"B) {question['option_b']}\n"
-        f"C) {question['option_c']}\n"
-        f"D) {question['option_d']}"
-    )
-
-    keyboard = [
-        [
-            InlineKeyboardButton(
-                "A",
-                callback_data=f"ans:{session_id}:A"
-            ),
-            InlineKeyboardButton(
-                "B",
-                callback_data=f"ans:{session_id}:B"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "C",
-                callback_data=f"ans:{session_id}:C"
-            ),
-            InlineKeyboardButton(
-                "D",
-                callback_data=f"ans:{session_id}:D"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "Stop Quiz",
-                callback_data=f"stopquiz:{session_id}"
-            )
-        ],
+    options = [
+        str(question["option_a"])[:100],
+        str(question["option_b"])[:100],
+        str(question["option_c"])[:100],
+        str(question["option_d"])[:100],
     ]
 
-    await update.effective_message.reply_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
+    correct_answer = str(
+        question["answer"]
+    ).strip().upper()
+
+    correct_option_id = (
+        ANSWER_LETTERS.index(correct_answer)
+        if correct_answer in ANSWER_LETTERS
+        else 0
+    )
+
+    explanation = (
+        question.get(
+            "explanation",
+            ""
         )
+        or ""
+    ).strip()
+
+    # Telegram poll explanation limit ~200 characters
+    poll_explanation = (
+        explanation[:195] + "..."
+        if len(explanation) > 195
+        else explanation
+    )
+
+    time_limit = clamp_quiz_time(
+        session.get("time_limit")
+        or get_quiz_time()
+    )
+
+    question_text = (
+        f"प्रश्न {index}/{total}\n\n"
+        f"{question['question']}"
+    )[:290]
+
+    message = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=question_text,
+        options=options,
+        type=Poll.QUIZ,
+        correct_option_id=correct_option_id,
+        is_anonymous=False,
+        explanation=poll_explanation or None,
+        open_period=time_limit,
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "Stop Quiz",
+                        callback_data=f"stopquiz:{session_id}"
+                    )
+                ]
+            ]
+        ),
+    )
+
+    ACTIVE_POLLS[
+        message.poll.id
+    ] = {
+        "session_id": session_id,
+        "question_id": question["id"],
+        "chat_id": chat_id,
+        "message_id": message.message_id,
+        "answered": False,
+    }
+
+    session["current_poll_id"] = message.poll.id
+
+    asyncio.create_task(
+        quiz_timeout_watcher(
+            context,
+            session_id,
+            message.poll.id,
+            time_limit
+        )
+    )
+
+
+# ============================================================
+# QUIZ TIMEOUT WATCHER
+# ============================================================
+
+async def quiz_timeout_watcher(
+    context,
+    session_id,
+    poll_id,
+    time_limit
+):
+
+    await asyncio.sleep(
+        time_limit + 2
+    )
+
+    poll_info = ACTIVE_POLLS.get(
+        poll_id
+    )
+
+    if not poll_info:
+        return
+
+    if poll_info.get("answered"):
+        return
+
+    session = get_quiz_session(
+        session_id
+    )
+
+    if not session:
+
+        ACTIVE_POLLS.pop(
+            poll_id,
+            None
+        )
+
+        return
+
+    if session.get(
+        "current_poll_id"
+    ) != poll_id:
+
+        ACTIVE_POLLS.pop(
+            poll_id,
+            None
+        )
+
+        return
+
+    poll_info["answered"] = True
+
+    question_id = poll_info["question_id"]
+
+    session["skipped"] += 1
+
+    session["answered"].add(
+        question_id
+    )
+
+    mark_question_used(
+        session["user_id"],
+        question_id
+    )
+
+    chat_id = poll_info["chat_id"]
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⏰ समय समाप्त हो गया। अगला प्रश्न..."
+        )
+
+    except Exception:
+        logger.exception(
+            "Timeout notice failed"
+        )
+
+    ACTIVE_POLLS.pop(
+        poll_id,
+        None
+    )
+
+    session["index"] += 1
+
+    await advance_quiz(
+        context,
+        session_id,
+        chat_id
+    )
+
+
+# ============================================================
+# ADVANCE QUIZ / SCORECARD
+# ============================================================
+
+async def advance_quiz(
+    context,
+    session_id,
+    chat_id
+):
+
+    session = get_quiz_session(
+        session_id
+    )
+
+    if not session:
+        return
+
+    if session["index"] < len(
+        session["questions"]
+    ):
+
+        await send_quiz_question(
+            context,
+            chat_id,
+            session_id
+        )
+
+    else:
+
+        await send_scorecard(
+            context,
+            chat_id,
+            session
+        )
+
+        remove_quiz_session(
+            session_id
+        )
+
+
+async def send_scorecard(
+    context,
+    chat_id,
+    session
+):
+
+    total = len(
+        session["questions"]
+    )
+
+    correct = session["correct"]
+    wrong = session["wrong"]
+    skipped = session["skipped"]
+    score = session["score"]
+
+    accuracy = (
+        (correct / total) * 100
+        if total else 0
+    )
+
+    text = (
+        "🏆 Quiz पूरा हो गया!\n\n"
+        f"कुल प्रश्न: {total}\n"
+        f"सही: {correct}\n"
+        f"गलत: {wrong}\n"
+        f"छूटे/Skip: {skipped}\n"
+        f"Accuracy: {accuracy:.1f}%\n"
+        f"स्कोर: {score:.2f}"
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=text
     )
 
 
@@ -3411,12 +3629,23 @@ async def quiz_command(
 
     count = DEFAULT_QUIZ_COUNT
 
+    time_limit = None
+
     if args:
 
         try:
             count = int(args[0])
         except Exception:
             count = DEFAULT_QUIZ_COUNT
+
+        if len(args) > 1:
+
+            try:
+                time_limit = clamp_quiz_time(
+                    int(args[1])
+                )
+            except Exception:
+                time_limit = None
 
     count = max(
         1,
@@ -3455,12 +3684,13 @@ async def quiz_command(
 
     session_id = create_quiz_session(
         user_id=user.id,
-        questions=questions
+        questions=questions,
+        time_limit=time_limit
     )
 
     await send_quiz_question(
-        update,
         context,
+        update.effective_chat.id,
         session_id
     )
 
@@ -3486,7 +3716,7 @@ async def quizid_command(
 
         await update.message.reply_text(
             "Usage:\n"
-            "/quizid QUIZ_ID"
+            "/quizid QUIZ_ID [seconds]"
         )
 
         return
@@ -3504,6 +3734,17 @@ async def quizid_command(
         )
 
         return
+
+    time_limit = None
+
+    if len(context.args) > 1:
+
+        try:
+            time_limit = clamp_quiz_time(
+                int(context.args[1])
+            )
+        except Exception:
+            time_limit = None
 
     quiz = get_quiz(
         quiz_id
@@ -3535,49 +3776,44 @@ async def quizid_command(
     session_id = create_quiz_session(
         user_id=user.id,
         questions=questions,
-        quiz_id=quiz_id
+        quiz_id=quiz_id,
+        time_limit=time_limit
     )
 
     await send_quiz_question(
-        update,
         context,
+        update.effective_chat.id,
         session_id
     )
 
 
 # ============================================================
-# ANSWER CALLBACK
+# POLL ANSWER HANDLER (native quiz poll)
 # ============================================================
 
-async def answer_callback(
+async def poll_answer_handler(
     update,
     context
 ):
 
-    query = update.callback_query
+    poll_answer = update.poll_answer
 
-    await query.answer()
-
-    data = query.data or ""
-
-    parts = data.split(":")
-
-    if len(parts) != 3:
+    if not poll_answer:
         return
 
-    if parts[0] != "ans":
+    poll_id = poll_answer.poll_id
+
+    poll_info = ACTIVE_POLLS.get(
+        poll_id
+    )
+
+    if not poll_info:
         return
 
-    session_id = parts[1]
-    selected = parts[2].upper()
-
-    if selected not in (
-        "A",
-        "B",
-        "C",
-        "D"
-    ):
+    if poll_info.get("answered"):
         return
+
+    session_id = poll_info["session_id"]
 
     session = get_quiz_session(
         session_id
@@ -3585,51 +3821,54 @@ async def answer_callback(
 
     if not session:
 
-        await query.edit_message_text(
-            "यह quiz session समाप्त हो चुका है।"
+        ACTIVE_POLLS.pop(
+            poll_id,
+            None
         )
 
         return
 
-    if query.from_user.id != session["user_id"]:
+    user_id = (
+        poll_answer.user.id
+        if poll_answer.user
+        else None
+    )
 
-        await query.answer(
-            "यह quiz आपका नहीं है।",
-            show_alert=True
-        )
-
+    if user_id != session["user_id"]:
         return
 
-    index = session["index"]
+    question_id = poll_info["question_id"]
 
-    if index >= len(
-        session["questions"]
-    ):
-        return
-
-    question = session["questions"][index]
-
-    question_id = question["id"]
-
-    # Same question दोबारा answer न हो
     if question_id in session["answered"]:
 
-        await query.answer(
-            "यह question पहले ही answer हो चुका है।",
-            show_alert=True
+        ACTIVE_POLLS.pop(
+            poll_id,
+            None
         )
 
         return
+
+    poll_info["answered"] = True
 
     session["answered"].add(
         question_id
     )
 
+    index = session["index"]
+    question = session["questions"][index]
+
     correct_answer = str(
         question["answer"]
     ).strip().upper()
 
-    # Question को तुरंत history में डालना
+    selected_ids = poll_answer.option_ids or []
+
+    selected = (
+        ANSWER_LETTERS[selected_ids[0]]
+        if selected_ids and selected_ids[0] < len(ANSWER_LETTERS)
+        else None
+    )
+
     mark_question_used(
         session["user_id"],
         question_id
@@ -3640,7 +3879,7 @@ async def answer_callback(
         session["correct"] += 1
         session["score"] += 1
 
-        result_text = "सही उत्तर"
+        result_text = "🎉 सही उत्तर! बधाई हो।"
 
     else:
 
@@ -3651,7 +3890,7 @@ async def answer_callback(
         session["score"] -= negative_mark
 
         result_text = (
-            "गलत उत्तर\n"
+            "❌ गलत उत्तर।\n"
             f"सही उत्तर: {correct_answer}"
         )
 
@@ -3663,11 +3902,7 @@ async def answer_callback(
         or ""
     ).strip()
 
-    response = (
-        f"{result_text}\n\n"
-        f"आपका उत्तर: {selected}\n"
-        f"सही उत्तर: {correct_answer}"
-    )
+    response = result_text
 
     if explanation:
 
@@ -3676,39 +3911,32 @@ async def answer_callback(
             f"{explanation}"
         )
 
-    await query.edit_message_text(
-        response
+    chat_id = poll_info["chat_id"]
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=response
+        )
+
+    except Exception:
+        logger.exception(
+            "Answer response failed"
+        )
+
+    ACTIVE_POLLS.pop(
+        poll_id,
+        None
     )
 
     session["index"] += 1
 
-    # अगला question
-    if session["index"] < len(
-        session["questions"]
-    ):
-
-        await send_quiz_question(
-            update,
-            context,
-            session_id
-        )
-
-    else:
-
-        score = session["score"]
-
-        await query.message.reply_text(
-            "Quiz पूरा हो गया।\n\n"
-            f"कुल प्रश्न: "
-            f"{len(session['questions'])}\n"
-            f"सही: {session['correct']}\n"
-            f"गलत: {session['wrong']}\n"
-            f"स्कोर: {score}"
-        )
-
-        remove_quiz_session(
-            session_id
-        )
+    await advance_quiz(
+        context,
+        session_id,
+        chat_id
+    )
 
 
 # ============================================================
@@ -3749,13 +3977,36 @@ async def stop_quiz_callback(
 
         return
 
+    poll_id = session.get(
+        "current_poll_id"
+    )
+
+    if poll_id:
+
+        ACTIVE_POLLS.pop(
+            poll_id,
+            None
+        )
+
+        try:
+
+            await context.bot.stop_poll(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id
+            )
+
+        except Exception:
+            pass
+
     remove_quiz_session(
         session_id
     )
 
-    await query.edit_message_text(
+    await query.message.reply_text(
         "Quiz रोक दिया गया।"
-            )
+    )
+
+
     # ============================================================
 # START COMMAND
 # ============================================================
@@ -4598,6 +4849,81 @@ async def resetpenalty_command(
     await update.message.reply_text(
         "Negative marking reset हो गई।\n\n"
         f"Current value: {DEFAULT_NEGATIVE_MARK}"
+    )
+
+
+# ============================================================
+# QUIZ TIMER (PER QUESTION)
+# ============================================================
+
+async def quiztime_command(
+    update,
+    context
+):
+
+    if not await require_admin(update):
+        return
+
+    if not context.args:
+
+        current = get_quiz_time()
+
+        await update.message.reply_text(
+            f"Current quiz timer: {current} seconds\n\n"
+            "Set करने के लिए:\n"
+            "/quiztime 30\n\n"
+            f"Allowed range: {MIN_QUIZ_TIME_SECONDS}-"
+            f"{MAX_QUIZ_TIME_SECONDS} सेकंड"
+        )
+
+        return
+
+    try:
+
+        value = int(
+            context.args[0]
+        )
+
+    except Exception:
+
+        await update.message.reply_text(
+            "Invalid value.\n\n"
+            "Example:\n"
+            "/quiztime 30"
+        )
+
+        return
+
+    value = clamp_quiz_time(
+        value
+    )
+
+    set_setting(
+        "quiz_time_seconds",
+        str(value)
+    )
+
+    await update.message.reply_text(
+        f"Quiz timer set कर दिया गया: {value} सेकंड"
+    )
+
+
+async def resetquiztime_command(
+    update,
+    context
+):
+
+    if not await require_admin(update):
+        return
+
+    set_setting(
+        "quiz_time_seconds",
+        str(DEFAULT_QUIZ_TIME_SECONDS)
+    )
+
+    await update.message.reply_text(
+        "Quiz timer reset हो गया।\n\n"
+        f"Current value: {DEFAULT_QUIZ_TIME_SECONDS} सेकंड"
     )
 
 
@@ -7389,6 +7715,20 @@ def build_application():
         )
     )
 
+    application.add_handler(
+        CommandHandler(
+            "quiztime",
+            quiztime_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resetquiztime",
+            resetquiztime_command
+        )
+    )
+
     # ========================================================
     # STOP / CANCEL
     # ========================================================
@@ -7412,9 +7752,8 @@ def build_application():
     # ========================================================
 
     application.add_handler(
-        CallbackQueryHandler(
-            answer_callback,
-            pattern=r"^ans:"
+        PollAnswerHandler(
+            poll_answer_handler
         )
     )
 
