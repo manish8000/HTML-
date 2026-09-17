@@ -88,6 +88,17 @@ GROQ_MODEL = os.getenv(
     "openai/gpt-oss-120b"
 )
 
+# Scanned/image PDF OCR model. Override with GROQ_VISION_MODEL if needed.
+GROQ_VISION_MODEL = os.getenv(
+    "GROQ_VISION_MODEL",
+    "qwen/qwen3.6-27b"
+)
+
+# Automatic document-to-MCQ settings. No question count is requested from the user.
+AUTO_IMPORT_CHUNK_CHARS = int(os.getenv("AUTO_IMPORT_CHUNK_CHARS", "12000"))
+AUTO_IMPORT_QUESTIONS_PER_CHUNK = int(os.getenv("AUTO_IMPORT_QUESTIONS_PER_CHUNK", "12"))
+AUTO_IMPORT_MAX_QUESTIONS = int(os.getenv("AUTO_IMPORT_MAX_QUESTIONS", os.getenv("MAX_IMPORT_QUESTIONS", "500")))
+
 REQUEST_TIMEOUT = int(
     os.getenv(
         "REQUEST_TIMEOUT",
@@ -2964,36 +2975,85 @@ def scrape_and_generate(
 # ============================================================
 
 def extract_pdf_text(file_path):
-
+    """Extract text from normal PDFs. OCR fallback is handled separately."""
     try:
         from pypdf import PdfReader
 
-        reader = PdfReader(
-            str(file_path)
-        )
-
+        reader = PdfReader(str(file_path))
         pages = []
 
         for page in reader.pages:
-
             try:
                 text = page.extract_text() or ""
-
                 if text.strip():
                     pages.append(text)
-
             except Exception:
-                continue
+                logger.exception("PDF page text extraction failed")
 
         return "\n".join(pages)
 
     except Exception:
+        logger.exception("PDF extraction failed: %s", file_path)
+        return ""
 
-        logger.exception(
-            "PDF extraction failed: %s",
-            file_path
-        )
 
+def _ocr_pdf_with_groq(file_path, max_pages=None):
+    """OCR image/scanned PDF pages with Groq vision when PyMuPDF is installed."""
+    if groq_client is None:
+        return ""
+
+    try:
+        import base64
+        import fitz  # PyMuPDF
+    except Exception:
+        logger.exception("PyMuPDF/base64 unavailable for scanned PDF OCR")
+        return ""
+
+    try:
+        pdf = fitz.open(str(file_path))
+        page_limit = len(pdf) if max_pages is None else min(len(pdf), int(max_pages))
+        chunks = []
+
+        # Groq vision requests can accept multiple images. Keep batches small for reliability.
+        batch_size = 5
+        for batch_start in range(0, page_limit, batch_size):
+            content = [
+                {
+                    "type": "text",
+                    "text": (
+                        "इन PDF pages की पूरी readable text हिंदी/अंग्रेजी में ज्यों की त्यों निकालें। "
+                        "Page order बनाए रखें। कोई summary या MCQ न बनाएं; केवल OCR text दें।"
+                    ),
+                }
+            ]
+
+            for page_index in range(batch_start, min(batch_start + batch_size, page_limit)):
+                page = pdf.load_page(page_index)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+                image_b64 = base64.b64encode(pix.tobytes("jpeg", jpg_quality=80)).decode("ascii")
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
+                })
+
+            response = groq_client.chat.completions.create(
+                model=GROQ_VISION_MODEL,
+                messages=[
+                    {"role": "system", "content": "आप एक high-accuracy OCR assistant हैं। केवल source की text लौटाएं।"},
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=12000,
+            )
+            text = response.choices[0].message.content or ""
+            if text.strip():
+                chunks.append(text.strip())
+
+        pdf.close()
+        return "\n\n".join(chunks)
+
+    except Exception:
+        logger.exception("Groq vision OCR failed for PDF: %s", file_path)
         return ""
 
 
@@ -3139,96 +3199,93 @@ def import_questions_from_text(
     source="import",
     count=None
 ):
-    """
-    Returns a stats dict:
-    {
-        "ids": [question_id, ...],   # actually-added question ids
-        "added": int,
-        "duplicate": int,
-        "failed": int,
-        "total": int,
-    }
-    """
+    """Generate and save MCQs from the complete document.
 
-    empty_result = {
-        "ids": [],
-        "added": 0,
-        "duplicate": 0,
-        "failed": 0,
-        "total": 0,
-    }
-
-    if not text:
-        return empty_result
+    If count is supplied, preserve the old fixed-count behavior.
+    If count is None, automatically process the whole text in chunks and
+    generate as many useful non-duplicate questions as the configured limit allows.
+    """
+    result = {"ids": [], "added": 0, "duplicate": 0, "failed": 0, "total": 0}
+    if not text or not str(text).strip():
+        return result
 
     text = str(text)
 
-    # Groq को बहुत बड़ा input न भेजें
-    text = text[:50000]
+    # Legacy/manual fixed-count import.
+    if count is not None:
+        try:
+            count = int(count)
+        except Exception:
+            count = DEFAULT_QUIZ_COUNT
+        count = max(1, min(count, MAX_IMPORT_QUESTIONS))
+        question_batches = [text[:50000]]
+        counts = [count]
+    else:
+        # Automatic mode: do not truncate the document to the first 50k chars.
+        chunk_size = max(4000, AUTO_IMPORT_CHUNK_CHARS)
+        per_chunk = max(1, AUTO_IMPORT_QUESTIONS_PER_CHUNK)
+        max_questions = max(1, min(AUTO_IMPORT_MAX_QUESTIONS, MAX_IMPORT_QUESTIONS))
+        question_batches = [
+            text[i:i + chunk_size]
+            for i in range(0, len(text), chunk_size)
+            if text[i:i + chunk_size].strip()
+        ]
+        counts = [min(per_chunk, max_questions)] * len(question_batches)
 
-    if count is None:
+    generated_hashes = set()
 
-        count = DEFAULT_QUIZ_COUNT
-
-    try:
-        count = int(count)
-    except Exception:
-        count = DEFAULT_QUIZ_COUNT
-
-    count = max(
-        1,
-        min(
-            count,
-            MAX_IMPORT_QUESTIONS
-        )
-    )
-
-    questions = groq_generate_questions(
-        topic=(
-            "दिए गए अध्ययन सामग्री से "
-            "महत्वपूर्ण परीक्षा उपयोगी MCQ तैयार करें।"
-        ),
-        count=count,
-        context_text=text,
-        source=source,
-    )
-
-    saved_ids = []
-    added = 0
-    duplicate = 0
-    failed = 0
-
-    for question in questions:
+    for chunk_index, (chunk, batch_count) in enumerate(zip(question_batches, counts), start=1):
+        if not result["ids"] and chunk_index == 1:
+            pass
+        remaining = MAX_IMPORT_QUESTIONS - result["added"]
+        if count is None:
+            remaining = min(remaining, AUTO_IMPORT_MAX_QUESTIONS - result["added"])
+        if remaining <= 0:
+            break
+        batch_count = min(batch_count, remaining)
 
         try:
-
-            question_id, status = add_question(
-                question
+            questions = groq_generate_questions(
+                topic=(
+                    "दिए गए अध्ययन सामग्री के इस भाग से केवल source-grounded, "
+                    "महत्वपूर्ण परीक्षा उपयोगी MCQ तैयार करें। "
+                    "जहाँ source में पहले से प्रश्न हैं, उन्हें भी पहचानकर duplicate न बनाएं।"
+                ),
+                count=batch_count,
+                context_text=chunk,
+                source=source,
             )
-
-            if question_id and status == "added":
-                added += 1
-                saved_ids.append(question_id)
-            elif question_id and status == "duplicate":
-                duplicate += 1
-            else:
-                failed += 1
-
         except Exception:
+            logger.exception("MCQ generation failed for %s chunk %s", source, chunk_index)
+            result["failed"] += 1
+            continue
 
-            logger.exception(
-                "Imported question save failed"
-            )
+        result["total"] += len(questions)
 
-            failed += 1
+        for question in questions:
+            try:
+                q_hash = question_hash(
+                    question["question"], question["option_a"], question["option_b"],
+                    question["option_c"], question["option_d"]
+                )
+                if q_hash in generated_hashes:
+                    result["duplicate"] += 1
+                    continue
+                generated_hashes.add(q_hash)
 
-    return {
-        "ids": saved_ids,
-        "added": added,
-        "duplicate": duplicate,
-        "failed": failed,
-        "total": len(questions),
-    }
+                question_id, status = add_question(question)
+                if question_id and status == "added":
+                    result["added"] += 1
+                    result["ids"].append(question_id)
+                elif question_id and status == "duplicate":
+                    result["duplicate"] += 1
+                else:
+                    result["failed"] += 1
+            except Exception:
+                logger.exception("Imported question save failed")
+                result["failed"] += 1
+
+    return result
 
 
 # ============================================================
@@ -3241,35 +3298,31 @@ def import_pdf(
     file_name,
     count=None
 ):
+    empty_result = {"ids": [], "added": 0, "duplicate": 0, "failed": 0, "total": 0}
 
-    text = extract_pdf_text(
-        file_path
-    )
+    text = extract_pdf_text(file_path)
 
-    empty_result = {
-        "ids": [],
-        "added": 0,
-        "duplicate": 0,
-        "failed": 0,
-        "total": 0,
-    }
+    # Scanned/image PDFs often return little or no text through pypdf.
+    # Automatically fall back to Groq vision OCR instead of rejecting the PDF.
+    if len(text.strip()) < 100:
+        ocr_text = _ocr_pdf_with_groq(file_path)
+        if ocr_text.strip():
+            text = ocr_text
 
     if not text.strip():
         return empty_result
 
-    pdf_id = save_pdf_file(
+    save_pdf_file(
         user_id=user_id,
         file_name=file_name,
         file_path=file_path,
     )
 
-    result = import_questions_from_text(
+    return import_questions_from_text(
         text=text,
         source=file_name,
         count=count,
     )
-
-    return result
 
 
 # ============================================================
@@ -5785,136 +5838,14 @@ async def pending_text_handler(
     # --------------------------------------------------------
 
     if pending.get("action") == "auto_quiz_count":
-
-        try:
-            count = int(text)
-        except Exception:
-            await update.message.reply_text(
-                "कृपया केवल number भेजें।\n"
-                "Example: 10"
-            )
-            return
-
-        if count < 1:
-            await update.message.reply_text(
-                "Questions की संख्या कम से कम 1 होनी चाहिए।"
-            )
-            return
-
-        file_path = pending.get("file_path")
-        filename = pending.get("filename") or "file"
-        extension = pending.get("extension")
-
-        PENDING.pop(
-            user_id,
-            None
-        )
-
+        # Kept only for old pending state after a bot restart/deployment.
+        # New document uploads never ask for a question count.
         await update.message.reply_text(
-            "File process हो रही है और Quiz तैयार किया जा रहा है...\n"
-            "कृपया प्रतीक्षा करें।"
+            "इस file import को automatic mode में चलाने के लिए file दोबारा भेजें।\n"
+            "अब questions की संख्या पूछी नहीं जाएगी।"
         )
-
-        try:
-
-            if extension == ".pdf":
-
-                result = import_pdf(
-                    user_id=user_id,
-                    file_path=file_path,
-                    file_name=filename,
-                    count=count,
-                )
-
-            elif extension in (".html", ".htm"):
-
-                result = import_html(
-                    file_path=file_path,
-                    file_name=filename,
-                    count=count,
-                )
-
-            else:
-
-                result = import_txt(
-                    file_path=file_path,
-                    file_name=filename,
-                    count=count,
-                )
-
-        except Exception:
-
-            logger.exception(
-                "Auto quiz import failed"
-            )
-
-            await update.message.reply_text(
-                "File process करते समय error आया।"
-            )
-
-            return
-
-        finally:
-
-            try:
-                Path(file_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-        new_ids = (
-            result.get("ids", [])
-            if isinstance(result, dict)
-            else []
-        )
-
-        if not new_ids:
-
-            await update.message.reply_text(
-                "File से कोई भी question नहीं बन सका। "
-                "कृपया दूसरी file try करें।"
-            )
-
-            return
-
-        quiz_id = create_quiz_from_question_ids(
-            user_id=user_id,
-            title=f"Auto: {filename}",
-            question_ids=new_ids,
-        )
-
-        if not quiz_id:
-
-            await update.message.reply_text(
-                "Quiz create नहीं हो सका।"
-            )
-
-            return
-
-        quiz_questions = get_saved_quiz_questions(
-            quiz_id
-        )
-
-        if not quiz_questions:
-
-            await update.message.reply_text(
-                "Quiz में कोई questions नहीं मिले।"
-            )
-
-            return
-
-        session_id = create_quiz_session(
-            user_id=user_id,
-            questions=quiz_questions,
-            quiz_id=quiz_id,
-        )
-
-        await send_quiz_question(
-            context,
-            update.effective_chat.id,
-            session_id
-        )
-
         return
+
 
     data = parse_question_text(
         text
@@ -7350,13 +7281,14 @@ async def channel_pdf_handler(
             custom_path=str(destination)
         )
 
-        saved_ids = import_pdf(
+        result = import_pdf(
             user_id=0,
             file_path=str(destination),
             file_name=filename,
+            count=None,
         )
 
-        added = len(saved_ids)
+        added = result.get("added", 0) if isinstance(result, dict) else 0
 
         summary = (
             "📥 Channel PDF Auto-Import\n\n"
@@ -7437,53 +7369,96 @@ async def document_import_handler(
 
     if not pending:
 
-        if extension in (
-            ".pdf",
-            ".txt",
-            ".html",
-            ".htm",
-        ):
-
+        if extension in (".pdf", ".txt", ".html", ".htm"):
+            temp_path = None
             try:
+                temp_path = DATA_DIR / f"{uuid.uuid4().hex}{extension}"
+                telegram_file = await context.bot.get_file(document.file_id)
+                await telegram_file.download_to_drive(custom_path=str(temp_path))
 
-                temp_path = (
-                    DATA_DIR
-                    / f"{uuid.uuid4().hex}{extension}"
+                await update.message.reply_text(
+                    "File मिल गई।\n\n"
+                    "अब PDF/TXT/HTML को automatically पढ़कर जितने उपयोगी MCQ संभव हैं "
+                    "वे generate किए जाएंगे।\n"
+                    "Questions की संख्या बताने की जरूरत नहीं है।\n\n"
+                    "कृपया processing पूरी होने तक प्रतीक्षा करें..."
                 )
 
-                telegram_file = await context.bot.get_file(
-                    document.file_id
+                if extension == ".pdf":
+                    result = await asyncio.to_thread(
+                        import_pdf, user.id, str(temp_path), filename, None
+                    )
+                elif extension in (".html", ".htm"):
+                    result = await asyncio.to_thread(
+                        import_html, str(temp_path), filename, None
+                    )
+                else:
+                    result = await asyncio.to_thread(
+                        import_txt, str(temp_path), filename, None
+                    )
+
+                new_ids = result.get("ids", []) if isinstance(result, dict) else []
+                if not new_ids:
+                    await update.message.reply_text(
+                        "File पढ़ ली गई, लेकिन कोई valid नया MCQ नहीं बन सका।\n"
+                        "Scanned PDF के लिए Koyeb requirements में PyMuPDF install होना चाहिए।"
+                    )
+                    return
+
+                quiz_id = create_quiz_from_question_ids(
+                    user_id=user.id,
+                    title=f"Auto: {filename}",
+                    question_ids=new_ids,
+                )
+                if not quiz_id:
+                    await update.message.reply_text("Questions बन गए, लेकिन Quiz create नहीं हो सका।")
+                    return
+
+                quiz_questions = get_saved_quiz_questions(quiz_id)
+                if not quiz_questions:
+                    await update.message.reply_text("Quiz में questions नहीं मिले।")
+                    return
+
+                session_id = create_quiz_session(
+                    user_id=user.id,
+                    questions=quiz_questions,
+                    quiz_id=quiz_id,
                 )
 
-                await telegram_file.download_to_drive(
-                    custom_path=str(temp_path)
+                added = result.get("added", 0)
+                duplicate = result.get("duplicate", 0)
+                failed = result.get("failed", 0)
+                total = result.get("total", 0)
+
+                await update.message.reply_text(
+                    "Automatic Quiz तैयार है।\n\n"
+                    f"File: {filename}\n"
+                    f"Generated: {total}\n"
+                    f"Added: {added}\n"
+                    f"Duplicate: {duplicate}\n"
+                    f"Failed: {failed}\n"
+                    f"Quiz ID: {quiz_id}\n\n"
+                    "अब पहला question शुरू हो रहा है..."
+                )
+
+                await send_quiz_question(
+                    context,
+                    update.effective_chat.id,
+                    session_id,
                 )
 
             except Exception:
-
-                logger.exception(
-                    "Auto quiz file download failed"
-                )
-
+                logger.exception("Automatic document import failed: %s", filename)
                 await update.message.reply_text(
-                    "File download करते समय error आया।"
+                    "File process करते समय error आया।\n"
+                    "Log में पूरा error दर्ज है।"
                 )
-
-                return
-
-            PENDING[user.id] = {
-                "action": "auto_quiz_count",
-                "file_path": str(temp_path),
-                "filename": filename,
-                "extension": extension,
-            }
-
-            await update.message.reply_text(
-                "File मिल गई।\n\n"
-                "कितने questions बनाने हैं? सिर्फ number भेजें।\n"
-                "Example: 10\n\n"
-                "Cancel: /cancel"
-            )
+            finally:
+                if temp_path:
+                    try:
+                        Path(temp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
         return
 
