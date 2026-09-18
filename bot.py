@@ -48,6 +48,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "").strip()
 
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
@@ -94,10 +95,19 @@ GROQ_VISION_MODEL = os.getenv(
     "qwen/qwen3.6-27b"
 )
 
+# SerpAPI web-search settings, used by /autoquiz to ground AI question
+# generation in fresh web results instead of relying only on model memory.
+SERPAPI_RESULTS_COUNT = int(os.getenv("SERPAPI_RESULTS_COUNT", "8"))
+SERPAPI_FETCH_PAGES = int(os.getenv("SERPAPI_FETCH_PAGES", "3"))
+SERPAPI_CONTEXT_CHAR_LIMIT = int(os.getenv("SERPAPI_CONTEXT_CHAR_LIMIT", "20000"))
+
 # Automatic document-to-MCQ settings. No question count is requested from the user.
 AUTO_IMPORT_CHUNK_CHARS = int(os.getenv("AUTO_IMPORT_CHUNK_CHARS", "12000"))
 AUTO_IMPORT_QUESTIONS_PER_CHUNK = int(os.getenv("AUTO_IMPORT_QUESTIONS_PER_CHUNK", "12"))
 AUTO_IMPORT_MAX_QUESTIONS = int(os.getenv("AUTO_IMPORT_MAX_QUESTIONS", os.getenv("MAX_IMPORT_QUESTIONS", "500")))
+# Lightweight reliability controls. These do not increase normal DB/query cost.
+GROQ_MAX_RETRIES = int(os.getenv("GROQ_MAX_RETRIES", "2"))
+GROQ_RETRY_BASE_SECONDS = float(os.getenv("GROQ_RETRY_BASE_SECONDS", "1.5"))
 
 REQUEST_TIMEOUT = int(
     os.getenv(
@@ -526,6 +536,31 @@ def init_db():
                 updated_at TEXT
 
             );
+
+
+            CREATE TABLE IF NOT EXISTS document_import_cache (
+
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                file_hash TEXT UNIQUE NOT NULL,
+
+                filename TEXT,
+
+                source_type TEXT,
+
+                question_ids TEXT DEFAULT '[]',
+
+                status TEXT DEFAULT 'completed',
+
+                created_at TEXT,
+
+                updated_at TEXT
+
+            );
+
+
+            CREATE INDEX IF NOT EXISTS idx_document_cache_hash
+            ON document_import_cache(file_hash);
 
 
             CREATE TABLE IF NOT EXISTS bookmarks (
@@ -2353,6 +2388,19 @@ if GROQ_API_KEY:
 
 
 # ============================================================
+# SERPAPI CLIENT STATE
+# ============================================================
+
+SERPAPI_ENABLED = bool(SERPAPI_API_KEY)
+
+if not SERPAPI_ENABLED:
+    logger.warning(
+        "SERPAPI_API_KEY set नहीं है; /autoquiz web-search के बिना "
+        "सिर्फ AI knowledge से questions बनाएगा।"
+    )
+
+
+# ============================================================
 # EXTRACT JSON FROM GROQ RESPONSE
 # ============================================================
 
@@ -2616,29 +2664,44 @@ Context:
 {context_text}
 """
 
-    response = groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "आप MCQ generator हैं। "
-                    "केवल valid JSON array दें।"
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=0.4,
-        max_tokens=12000,
-    )
+    last_error = None
+    response = None
+    for attempt in range(max(1, GROQ_MAX_RETRIES + 1)):
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "आप MCQ generator हैं। "
+                            "केवल valid JSON array दें।"
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.4,
+                max_tokens=12000,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt >= GROQ_MAX_RETRIES:
+                raise
+            delay = GROQ_RETRY_BASE_SECONDS * (2 ** attempt)
+            logger.warning(
+                "Groq request failed (attempt %s/%s): %s; retrying in %.1fs",
+                attempt + 1, GROQ_MAX_RETRIES + 1, exc, delay
+            )
+            time.sleep(delay)
 
-    content = (
-        response.choices[0]
-        .message.content
-    )
+    if response is None:
+        raise last_error or RuntimeError("Groq request failed")
+
+    content = response.choices[0].message.content or ""
 
     parsed = extract_json(
         content
@@ -2780,6 +2843,188 @@ def html_to_text(
         )
 
         return ""
+
+
+# ============================================================
+# SERPAPI WEB SEARCH
+# ============================================================
+
+def serpapi_search(
+    query,
+    num_results=None
+):
+    """
+    SerpAPI (https://serpapi.com) के ज़रिए Google search results लाता है।
+    हर result में title, snippet और link होता है।
+    """
+
+    if not SERPAPI_API_KEY:
+        raise RuntimeError(
+            "SERPAPI_API_KEY configured नहीं है।"
+        )
+
+    num_results = int(
+        num_results or SERPAPI_RESULTS_COUNT
+    )
+
+    num_results = max(
+        1,
+        min(num_results, 20)
+    )
+
+    params = {
+        "engine": "google",
+        "q": query,
+        "num": num_results,
+        "hl": "hi",
+        "api_key": SERPAPI_API_KEY,
+    }
+
+    try:
+
+        response = requests.get(
+            "https://serpapi.com/search.json",
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+    except Exception:
+
+        logger.exception(
+            "SerpAPI request failed: %s",
+            query
+        )
+
+        raise RuntimeError(
+            "SerpAPI से data नहीं मिल सका।"
+        )
+
+    if isinstance(payload, dict) and payload.get("error"):
+        raise RuntimeError(
+            f"SerpAPI error: {payload.get('error')}"
+        )
+
+    results = []
+
+    for item in (payload.get("organic_results") or []):
+
+        title = normalize_text(
+            item.get("title") or ""
+        )
+
+        snippet = normalize_text(
+            item.get("snippet") or ""
+        )
+
+        link = (
+            item.get("link") or ""
+        ).strip()
+
+        if not (title or snippet):
+            continue
+
+        results.append({
+            "title": title,
+            "snippet": snippet,
+            "link": link,
+        })
+
+    # Google का सीधा "Answer Box" / knowledge panel भी उपयोगी context देता है
+    answer_box = payload.get("answer_box") or {}
+
+    if isinstance(answer_box, dict):
+
+        extra = normalize_text(
+            answer_box.get("snippet")
+            or answer_box.get("answer")
+            or ""
+        )
+
+        if extra:
+            results.insert(
+                0,
+                {
+                    "title": answer_box.get("title") or "Answer Box",
+                    "snippet": extra,
+                    "link": answer_box.get("link") or "",
+                }
+            )
+
+    return results[:num_results]
+
+
+def build_context_from_serpapi(
+    topic,
+    num_results=None,
+    fetch_pages=None
+):
+    """
+    किसी topic के लिए SerpAPI search results (और चुनिंदा pages) से
+    एक combined context text बनाता है, जो groq_generate_questions()
+    को context_text के रूप में दिया जा सके।
+    """
+
+    results = serpapi_search(
+        topic,
+        num_results=num_results
+    )
+
+    if not results:
+        return "", []
+
+    fetch_pages = int(
+        SERPAPI_FETCH_PAGES
+        if fetch_pages is None
+        else fetch_pages
+    )
+
+    fetch_pages = max(0, min(fetch_pages, len(results)))
+
+    parts = []
+    sources = []
+
+    for idx, item in enumerate(results):
+
+        block = (
+            f"Source {idx + 1}: {item['title']}\n"
+            f"{item['snippet']}"
+        )
+
+        parts.append(block)
+
+        if item.get("link"):
+            sources.append(item["link"])
+
+    # पहले कुछ top results के actual pages भी fetch करके
+    # ज़्यादा गहराई वाला context जोड़ते हैं (best-effort, silent fail)
+    for item in results[:fetch_pages]:
+
+        link = item.get("link")
+
+        if not link:
+            continue
+
+        try:
+
+            page_html = fetch_url(link)
+
+            page_text = html_to_text(page_html)
+
+            if page_text:
+                parts.append(
+                    f"Full page ({link}):\n{page_text[:4000]}"
+                )
+
+        except Exception:
+            continue
+
+    context_text = "\n\n".join(parts)[:SERPAPI_CONTEXT_CHAR_LIMIT]
+
+    return context_text, sources
 
 
 # ============================================================
@@ -3191,6 +3436,108 @@ def save_pdf_file(
 
 
 # ============================================================
+# DOCUMENT CACHE / FILE HASH
+# ============================================================
+
+def file_sha256(file_path, chunk_size=1024 * 1024):
+    """Calculate a file fingerprint without loading the whole file into RAM."""
+    digest = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as fh:
+            while True:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        logger.exception("File hash calculation failed: %s", file_path)
+        return ""
+
+
+def get_document_cache(file_hash):
+    if not file_hash:
+        return None
+    with DB_LOCK:
+        conn = db()
+        try:
+            row = conn.execute(
+                """
+                SELECT file_hash, filename, source_type, question_ids, status
+                FROM document_import_cache
+                WHERE file_hash = ?
+                LIMIT 1
+                """,
+                (file_hash,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                ids = json.loads(row["question_ids"] or "[]")
+            except Exception:
+                ids = []
+            ids = [int(x) for x in ids if str(x).isdigit()]
+            return {
+                "file_hash": row["file_hash"],
+                "filename": row["filename"] or "",
+                "source_type": row["source_type"] or "",
+                "question_ids": ids,
+                "status": row["status"] or "completed",
+            }
+        finally:
+            conn.close()
+
+
+def save_document_cache(file_hash, filename, source_type, question_ids, status="completed"):
+    if not file_hash:
+        return
+    ids_json = json.dumps([int(x) for x in (question_ids or []) if str(x).isdigit()])
+    now = utcnow()
+    with DB_LOCK:
+        conn = db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO document_import_cache
+                (file_hash, filename, source_type, question_ids, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_hash) DO UPDATE SET
+                    filename = excluded.filename,
+                    source_type = excluded.source_type,
+                    question_ids = excluded.question_ids,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (file_hash, filename, source_type, ids_json, status, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def get_cached_question_ids(file_hash):
+    """Return only active questions that still exist; stale IDs are discarded."""
+    cached = get_document_cache(file_hash)
+    if not cached or cached.get("status") != "completed":
+        return []
+    ids = cached.get("question_ids", [])
+    if not ids:
+        return []
+    placeholders = ",".join("?" for _ in ids)
+    with DB_LOCK:
+        conn = db()
+        try:
+            rows = conn.execute(
+                f"SELECT id FROM questions WHERE active = 1 AND id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+            existing = {int(r["id"]) for r in rows}
+            return [qid for qid in ids if qid in existing]
+        finally:
+            conn.close()
+
+
+# ============================================================
 # IMPORT QUESTIONS FROM TEXT
 # ============================================================
 
@@ -3298,7 +3645,21 @@ def import_pdf(
     file_name,
     count=None
 ):
-    empty_result = {"ids": [], "added": 0, "duplicate": 0, "failed": 0, "total": 0}
+    empty_result = {"ids": [], "added": 0, "duplicate": 0, "failed": 0, "total": 0, "cached": False}
+
+    # Same PDF दोबारा आने पर OCR/Groq generation बिल्कुल दोबारा नहीं चलेगा.
+    # SHA-256 streaming hash RAM usage को लगभग constant रखता है.
+    document_hash = file_sha256(file_path)
+    cached_ids = get_cached_question_ids(document_hash)
+    if cached_ids:
+        return {
+            "ids": cached_ids,
+            "added": 0,
+            "duplicate": len(cached_ids),
+            "failed": 0,
+            "total": len(cached_ids),
+            "cached": True,
+        }
 
     text = extract_pdf_text(file_path)
 
@@ -3318,11 +3679,25 @@ def import_pdf(
         file_path=file_path,
     )
 
-    return import_questions_from_text(
+    result = import_questions_from_text(
         text=text,
         source=file_name,
         count=count,
     )
+
+    # Empty/failed imports are not cached, so a temporary Groq/network failure
+    # can be retried normally on the next upload.
+    if document_hash and result.get("ids"):
+        save_document_cache(
+            document_hash,
+            file_name,
+            "pdf",
+            result.get("ids", []),
+            status="completed",
+        )
+
+    result["cached"] = False
+    return result
 
 
 # ============================================================
@@ -5559,6 +5934,9 @@ Question delete करें
 /generate 10 Topic
 AI से questions बनाएं
 
+/autoquiz [COUNT] TOPIC
+SerpAPI web-search + AI से quiz अपने आप बनाकर शुरू करें
+
 /scrape SOURCE
 Website से content लेकर questions बनाएं
 
@@ -6685,6 +7063,225 @@ async def generate_command(update, context):
 
 
 # ============================================================
+# AUTOQUIZ COMMAND (SERPAPI WEB SEARCH + AI GENERATION)
+# ============================================================
+
+async def autoquiz_command(update, context):
+    """
+    /autoquiz [COUNT] TOPIC
+
+    Command भेजते ही, बिना किसी और interaction के:
+      1. SerpAPI से topic पर web search किया जाता है।
+      2. Search results (+ कुछ pages) से context बनाया जाता है।
+      3. उस context के आधार पर Groq से MCQ questions बनते हैं।
+      4. Questions DB में save होकर quiz बनता है।
+      5. Quiz session तुरंत शुरू हो जाता है (पहला question auto-भेजा जाता है)।
+    """
+
+    if not await require_admin(update):
+        return
+
+    if not SERPAPI_API_KEY:
+        await update.message.reply_text(
+            "SERPAPI_API_KEY environment variable set नहीं है।\n"
+            "Web-search के बिना यह command काम नहीं करेगा।\n\n"
+            "इसके बजाय आप /generate COUNT TOPIC इस्तेमाल कर सकते हैं।"
+        )
+        return
+
+    if groq_client is None:
+        await update.message.reply_text(
+            "GROQ_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n\n"
+            "/autoquiz [COUNT] TOPIC\n\n"
+            "Examples:\n"
+            "/autoquiz Rajasthan Current Affairs\n"
+            "/autoquiz 15 Indian Polity\n\n"
+            "COUNT न देने पर डिफ़ॉल्ट questions बनेंगे।"
+        )
+        return
+
+    args = list(context.args)
+
+    count = DEFAULT_QUIZ_COUNT
+
+    if args and args[0].isdigit():
+        count = int(args[0])
+        args = args[1:]
+
+    count = max(
+        1,
+        min(count, MAX_IMPORT_QUESTIONS)
+    )
+
+    topic = " ".join(args).strip()
+
+    if not topic:
+        await update.message.reply_text(
+            "Topic देना जरूरी है।\n\n"
+            "Example:\n"
+            "/autoquiz 10 Rajasthan GK"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔎 SerpAPI से \"{topic}\" पर web search किया जा रहा है...\n"
+        f"इसके बाद AI {count} questions generate करेगा और quiz अपने आप शुरू हो जाएगा।\n"
+        "कृपया प्रतीक्षा करें..."
+    )
+
+    try:
+
+        context_text, sources = await asyncio.to_thread(
+            build_context_from_serpapi,
+            topic,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "SerpAPI search failed for autoquiz: %s",
+            topic
+        )
+
+        await update.message.reply_text(
+            "Web search में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not context_text:
+        await update.message.reply_text(
+            "इस topic के लिए कोई useful web result नहीं मिला।\n"
+            "कृपया topic थोड़ा अलग तरीके से लिखकर दोबारा try करें।"
+        )
+        return
+
+    try:
+
+        questions = await asyncio.to_thread(
+            groq_generate_questions,
+            topic,
+            count,
+            context_text,
+            "serpapi",
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "AI generation from SerpAPI context failed: %s",
+            topic
+        )
+
+        await update.message.reply_text(
+            "AI question generation में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not questions:
+        await update.message.reply_text(
+            "AI से कोई valid question प्राप्त नहीं हुआ।\n"
+            "कृपया दोबारा try करें या topic बदलें।"
+        )
+        return
+
+    added = 0
+    duplicate = 0
+    failed = 0
+    new_ids = []
+
+    for question in questions:
+
+        try:
+
+            question_id, status = add_question(
+                question
+            )
+
+            if question_id and status == "added":
+                added += 1
+                new_ids.append(question_id)
+            elif question_id and status == "duplicate":
+                duplicate += 1
+            else:
+                failed += 1
+
+        except Exception:
+
+            logger.exception(
+                "Question save failed (autoquiz)"
+            )
+
+            failed += 1
+
+    if not new_ids:
+        await update.message.reply_text(
+            "Questions generate हुए लेकिन सभी duplicate/invalid निकले।\n"
+            f"Generated: {len(questions)} | Duplicate: {duplicate} | Failed: {failed}"
+        )
+        return
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=f"AutoQuiz: {topic}"[:100],
+        question_ids=new_ids,
+    )
+
+    if not quiz_id:
+        await update.message.reply_text(
+            "Questions बन गए, लेकिन Quiz create नहीं हो सका।"
+        )
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+        await update.message.reply_text(
+            "Quiz में questions नहीं मिले।"
+        )
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    source_note = ""
+
+    if sources:
+        top_sources = "\n".join(f"• {link}" for link in sources[:3])
+        source_note = f"\n\nTop sources:\n{top_sources}"
+
+    await update.message.reply_text(
+        "✅ AutoQuiz तैयार है।\n\n"
+        f"Topic: {topic}\n"
+        f"Generated: {len(questions)}\n"
+        f"Added: {added}\n"
+        f"Duplicate: {duplicate}\n"
+        f"Failed: {failed}\n"
+        f"Quiz ID: {quiz_id}"
+        f"{source_note}\n\n"
+        "पहला question शुरू हो रहा है..."
+    )
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
+    )
+
+
+# ============================================================
 # SCRAPE COMMAND
 # ============================================================
 
@@ -7430,6 +8027,7 @@ async def document_import_handler(
                 failed = result.get("failed", 0)
                 total = result.get("total", 0)
 
+                cached_note = "\n♻️ यह PDF पहले process हो चुकी थी; AI processing दोबारा नहीं चली।" if result.get("cached") else ""
                 await update.message.reply_text(
                     "Automatic Quiz तैयार है।\n\n"
                     f"File: {filename}\n"
@@ -7437,7 +8035,7 @@ async def document_import_handler(
                     f"Added: {added}\n"
                     f"Duplicate: {duplicate}\n"
                     f"Failed: {failed}\n"
-                    f"Quiz ID: {quiz_id}\n\n"
+                    f"Quiz ID: {quiz_id}{cached_note}\n\n"
                     "अब पहला question शुरू हो रहा है..."
                 )
 
@@ -9415,6 +10013,13 @@ def build_application():
         CommandHandler(
             "generate",
             generate_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "autoquiz",
+            autoquiz_command
         )
     )
 
