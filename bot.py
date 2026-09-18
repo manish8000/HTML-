@@ -2851,11 +2851,14 @@ def html_to_text(
 
 def serpapi_search(
     query,
-    num_results=None
+    num_results=None,
+    engine="google"
 ):
     """
-    SerpAPI (https://serpapi.com) के ज़रिए Google search results लाता है।
-    हर result में title, snippet और link होता है।
+    SerpAPI (https://serpapi.com) के ज़रिए search results लाता है।
+    engine="google"      -> सामान्य Google search (organic_results)
+    engine="google_news" -> Google News (news_results), current affairs के लिए
+    हर result में title, snippet, link (और news हो तो date) होता है।
     """
 
     if not SERPAPI_API_KEY:
@@ -2873,10 +2876,11 @@ def serpapi_search(
     )
 
     params = {
-        "engine": "google",
+        "engine": engine,
         "q": query,
         "num": num_results,
         "hl": "hi",
+        "gl": "in",
         "api_key": SERPAPI_API_KEY,
     }
 
@@ -2895,7 +2899,8 @@ def serpapi_search(
     except Exception:
 
         logger.exception(
-            "SerpAPI request failed: %s",
+            "SerpAPI request failed (engine=%s): %s",
+            engine,
             query
         )
 
@@ -2910,19 +2915,35 @@ def serpapi_search(
 
     results = []
 
-    for item in (payload.get("organic_results") or []):
+    result_key = (
+        "news_results"
+        if engine == "google_news"
+        else "organic_results"
+    )
+
+    for item in (payload.get(result_key) or []):
 
         title = normalize_text(
             item.get("title") or ""
         )
 
         snippet = normalize_text(
-            item.get("snippet") or ""
+            item.get("snippet") or item.get("summary") or ""
         )
 
         link = (
             item.get("link") or ""
         ).strip()
+
+        date = normalize_text(
+            item.get("date") or ""
+        )
+
+        source_name = normalize_text(
+            (item.get("source") or {}).get("name")
+            if isinstance(item.get("source"), dict)
+            else (item.get("source") or "")
+        )
 
         if not (title or snippet):
             continue
@@ -2931,6 +2952,8 @@ def serpapi_search(
             "title": title,
             "snippet": snippet,
             "link": link,
+            "date": date,
+            "source": source_name,
         })
 
     # Google का सीधा "Answer Box" / knowledge panel भी उपयोगी context देता है
@@ -2951,6 +2974,8 @@ def serpapi_search(
                     "title": answer_box.get("title") or "Answer Box",
                     "snippet": extra,
                     "link": answer_box.get("link") or "",
+                    "date": "",
+                    "source": "",
                 }
             )
 
@@ -2960,17 +2985,20 @@ def serpapi_search(
 def build_context_from_serpapi(
     topic,
     num_results=None,
-    fetch_pages=None
+    fetch_pages=None,
+    engine="google"
 ):
     """
     किसी topic के लिए SerpAPI search results (और चुनिंदा pages) से
     एक combined context text बनाता है, जो groq_generate_questions()
     को context_text के रूप में दिया जा सके।
+    engine="google_news" देने पर Google News results (current affairs) आते हैं।
     """
 
     results = serpapi_search(
         topic,
-        num_results=num_results
+        num_results=num_results,
+        engine=engine,
     )
 
     if not results:
@@ -2989,8 +3017,11 @@ def build_context_from_serpapi(
 
     for idx, item in enumerate(results):
 
+        date_bit = f" ({item['date']})" if item.get("date") else ""
+        source_bit = f" [{item['source']}]" if item.get("source") else ""
+
         block = (
-            f"Source {idx + 1}: {item['title']}\n"
+            f"Source {idx + 1}: {item['title']}{date_bit}{source_bit}\n"
             f"{item['snippet']}"
         )
 
@@ -5937,6 +5968,12 @@ AI से questions बनाएं
 /autoquiz [COUNT] TOPIC
 SerpAPI web-search + AI से quiz अपने आप बनाकर शुरू करें
 
+/newsquiz [COUNT] TOPIC
+SerpAPI Google News से current-affairs quiz अपने आप बनाकर शुरू करें
+
+/websearch QUERY
+Quiz बनाए बिना सिर्फ SerpAPI results देखें
+
 /scrape SOURCE
 Website से content लेकर questions बनाएं
 
@@ -7264,6 +7301,301 @@ async def autoquiz_command(update, context):
 
     await update.message.reply_text(
         "✅ AutoQuiz तैयार है।\n\n"
+        f"Topic: {topic}\n"
+        f"Generated: {len(questions)}\n"
+        f"Added: {added}\n"
+        f"Duplicate: {duplicate}\n"
+        f"Failed: {failed}\n"
+        f"Quiz ID: {quiz_id}"
+        f"{source_note}\n\n"
+        "पहला question शुरू हो रहा है..."
+    )
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
+    )
+
+
+# ============================================================
+# WEBSEARCH COMMAND (RAW SERPAPI RESULTS, NO QUIZ)
+# ============================================================
+
+async def websearch_command(update, context):
+    """
+    /websearch QUERY
+
+    Sirf SerpAPI (Google) results dikhata hai — koi quiz nahi banta।
+    Ye check karne ke liye ki /autoquiz chalane se pehle topic par
+    kaafi content मिल रहा है ya nahi।
+    """
+
+    if not await require_admin(update):
+        return
+
+    if not SERPAPI_API_KEY:
+        await update.message.reply_text(
+            "SERPAPI_API_KEY environment variable set नहीं है।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n\n"
+            "/websearch QUERY\n\n"
+            "Example:\n"
+            "/websearch Rajasthan GK 2026"
+        )
+        return
+
+    query = " ".join(context.args).strip()
+
+    await update.message.reply_text(
+        f"🔎 \"{query}\" search किया जा रहा है..."
+    )
+
+    try:
+
+        results = await asyncio.to_thread(
+            serpapi_search,
+            query,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "SerpAPI websearch failed: %s",
+            query
+        )
+
+        await update.message.reply_text(
+            "Search में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not results:
+        await update.message.reply_text(
+            "कोई result नहीं मिला।"
+        )
+        return
+
+    lines = [f"🔎 Results: {query}\n"]
+
+    for idx, item in enumerate(results, start=1):
+
+        lines.append(
+            f"{idx}. {item['title']}\n"
+            f"{item['snippet']}\n"
+            f"{item.get('link', '')}\n"
+        )
+
+    text = "\n".join(lines)[:4000]
+
+    await update.message.reply_text(text)
+
+
+# ============================================================
+# NEWSQUIZ COMMAND (SERPAPI GOOGLE NEWS + AI GENERATION)
+# ============================================================
+
+async def newsquiz_command(update, context):
+    """
+    /newsquiz [COUNT] TOPIC
+
+    /autoquiz जैसा ही, लेकिन SerpAPI के Google News engine से
+    latest current-affairs news उठाता है और उसी पर current-affairs
+    quiz बनाकर तुरंत शुरू कर देता है।
+    """
+
+    if not await require_admin(update):
+        return
+
+    if not SERPAPI_API_KEY:
+        await update.message.reply_text(
+            "SERPAPI_API_KEY environment variable set नहीं है।"
+        )
+        return
+
+    if groq_client is None:
+        await update.message.reply_text(
+            "GROQ_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n\n"
+            "/newsquiz [COUNT] TOPIC\n\n"
+            "Examples:\n"
+            "/newsquiz Rajasthan Current Affairs\n"
+            "/newsquiz 15 India Current Affairs September 2026"
+        )
+        return
+
+    args = list(context.args)
+
+    count = DEFAULT_QUIZ_COUNT
+
+    if args and args[0].isdigit():
+        count = int(args[0])
+        args = args[1:]
+
+    count = max(
+        1,
+        min(count, MAX_IMPORT_QUESTIONS)
+    )
+
+    topic = " ".join(args).strip()
+
+    if not topic:
+        await update.message.reply_text(
+            "Topic देना जरूरी है।\n\n"
+            "Example:\n"
+            "/newsquiz 10 Rajasthan Current Affairs"
+        )
+        return
+
+    await update.message.reply_text(
+        f"📰 SerpAPI Google News से \"{topic}\" की latest news लाई जा रही है...\n"
+        f"इसके बाद AI {count} current-affairs questions generate करेगा और quiz अपने आप शुरू हो जाएगा।\n"
+        "कृपया प्रतीक्षा करें..."
+    )
+
+    try:
+
+        context_text, sources = await asyncio.to_thread(
+            build_context_from_serpapi,
+            topic,
+            None,
+            None,
+            "google_news",
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "SerpAPI news search failed for newsquiz: %s",
+            topic
+        )
+
+        await update.message.reply_text(
+            "News search में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not context_text:
+        await update.message.reply_text(
+            "इस topic के लिए कोई recent news नहीं मिली।\n"
+            "कृपया topic थोड़ा अलग तरीके से लिखकर दोबारा try करें।"
+        )
+        return
+
+    try:
+
+        questions = await asyncio.to_thread(
+            groq_generate_questions,
+            topic,
+            count,
+            context_text,
+            "serpapi_news",
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "AI generation from news context failed: %s",
+            topic
+        )
+
+        await update.message.reply_text(
+            "AI question generation में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not questions:
+        await update.message.reply_text(
+            "AI से कोई valid question प्राप्त नहीं हुआ।\n"
+            "कृपया दोबारा try करें या topic बदलें।"
+        )
+        return
+
+    added = 0
+    duplicate = 0
+    failed = 0
+    new_ids = []
+
+    for question in questions:
+
+        try:
+
+            question_id, status = add_question(
+                question
+            )
+
+            if question_id and status == "added":
+                added += 1
+                new_ids.append(question_id)
+            elif question_id and status == "duplicate":
+                duplicate += 1
+            else:
+                failed += 1
+
+        except Exception:
+
+            logger.exception(
+                "Question save failed (newsquiz)"
+            )
+
+            failed += 1
+
+    if not new_ids:
+        await update.message.reply_text(
+            "Questions generate हुए लेकिन सभी duplicate/invalid निकले।\n"
+            f"Generated: {len(questions)} | Duplicate: {duplicate} | Failed: {failed}"
+        )
+        return
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=f"NewsQuiz: {topic}"[:100],
+        question_ids=new_ids,
+    )
+
+    if not quiz_id:
+        await update.message.reply_text(
+            "Questions बन गए, लेकिन Quiz create नहीं हो सका।"
+        )
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+        await update.message.reply_text(
+            "Quiz में questions नहीं मिले।"
+        )
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    source_note = ""
+
+    if sources:
+        top_sources = "\n".join(f"• {link}" for link in sources[:3])
+        source_note = f"\n\nTop news sources:\n{top_sources}"
+
+    await update.message.reply_text(
+        "✅ NewsQuiz तैयार है।\n\n"
         f"Topic: {topic}\n"
         f"Generated: {len(questions)}\n"
         f"Added: {added}\n"
@@ -10020,6 +10352,20 @@ def build_application():
         CommandHandler(
             "autoquiz",
             autoquiz_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "websearch",
+            websearch_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "newsquiz",
+            newsquiz_command
         )
     )
 
