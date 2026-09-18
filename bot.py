@@ -4159,29 +4159,43 @@ def create_quiz(
 
     try:
 
-        if negative_mark is None:
-            negative_mark = get_negative_mark()
+        # NOTE: `quizzes` table के actual columns हैं:
+        # name, description, created_by, active, created_at, updated_at.
+        # (पहले यहाँ title/user_id/exam/subject/negative_mark columns में
+        # insert होता था, जो table में मौजूद ही नहीं थे — इसी वजह से हर बार
+        # "Quiz create नहीं हो सका" error आता था और आगे कोई quiz नहीं बनता था।)
+
+        description_parts = []
+
+        if exam:
+            description_parts.append(f"Exam: {exam}")
+
+        if subject:
+            description_parts.append(f"Subject: {subject}")
+
+        description = " | ".join(description_parts)
+
+        now = utcnow()
 
         cursor = conn.execute(
             """
             INSERT INTO quizzes
             (
-                title,
-                user_id,
-                exam,
-                subject,
-                negative_mark,
-                created_at
+                name,
+                description,
+                created_by,
+                active,
+                created_at,
+                updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 1, ?, ?)
             """,
             (
                 title,
+                description,
                 user_id,
-                exam or "",
-                subject or "",
-                float(negative_mark),
-                utcnow(),
+                now,
+                now,
             )
         )
 
@@ -4329,11 +4343,16 @@ def get_quiz(
             (quiz_id,)
         ).fetchone()
 
-        return (
-            dict(row)
-            if row
-            else None
-        )
+        if not row:
+            return None
+
+        data = dict(row)
+
+        # बाकी code में कुछ जगह quiz["title"] पढ़ा जाता है, जबकि actual
+        # column "name" है — backward-compat के लिए alias जोड़ रहे हैं।
+        data.setdefault("title", data.get("name"))
+
+        return data
 
     finally:
 
@@ -9132,11 +9151,8 @@ def clone_saved_quiz(
     )
 
     new_quiz_id = create_quiz(
-        owner_id=owner_id,
+        user_id=owner_id,
         title=title,
-        description=source["description"]
-        if "description" in source.keys()
-        else ""
     )
 
     if not new_quiz_id:
