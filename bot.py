@@ -101,6 +101,19 @@ SERPAPI_RESULTS_COUNT = int(os.getenv("SERPAPI_RESULTS_COUNT", "8"))
 SERPAPI_FETCH_PAGES = int(os.getenv("SERPAPI_FETCH_PAGES", "3"))
 SERPAPI_CONTEXT_CHAR_LIMIT = int(os.getenv("SERPAPI_CONTEXT_CHAR_LIMIT", "20000"))
 
+# Wikipedia settings, used by /wikiquiz. No API key needed — Wikipedia's
+# REST/MediaWiki API is free and open.
+WIKIPEDIA_LANG = os.getenv("WIKIPEDIA_LANG", "hi").strip() or "hi"
+WIKIPEDIA_RESULTS_COUNT = int(os.getenv("WIKIPEDIA_RESULTS_COUNT", "3"))
+WIKIPEDIA_CONTEXT_CHAR_LIMIT = int(os.getenv("WIKIPEDIA_CONTEXT_CHAR_LIMIT", "20000"))
+
+# Google Cloud Text-to-Speech settings, used by /speak to turn text into
+# a Telegram voice note.
+GOOGLE_TTS_API_KEY = os.getenv("GOOGLE_TTS_API_KEY", "").strip()
+GOOGLE_TTS_LANGUAGE_CODE = os.getenv("GOOGLE_TTS_LANGUAGE_CODE", "hi-IN").strip() or "hi-IN"
+GOOGLE_TTS_VOICE_NAME = os.getenv("GOOGLE_TTS_VOICE_NAME", "").strip()
+GOOGLE_TTS_CHAR_LIMIT = int(os.getenv("GOOGLE_TTS_CHAR_LIMIT", "800"))
+
 # Automatic document-to-MCQ settings. No question count is requested from the user.
 AUTO_IMPORT_CHUNK_CHARS = int(os.getenv("AUTO_IMPORT_CHUNK_CHARS", "12000"))
 AUTO_IMPORT_QUESTIONS_PER_CHUNK = int(os.getenv("AUTO_IMPORT_QUESTIONS_PER_CHUNK", "12"))
@@ -2401,6 +2414,18 @@ if not SERPAPI_ENABLED:
 
 
 # ============================================================
+# GOOGLE CLOUD TTS STATE
+# ============================================================
+
+GOOGLE_TTS_ENABLED = bool(GOOGLE_TTS_API_KEY)
+
+if not GOOGLE_TTS_ENABLED:
+    logger.warning(
+        "GOOGLE_TTS_API_KEY set नहीं है; /speak काम नहीं करेगा।"
+    )
+
+
+# ============================================================
 # EXTRACT JSON FROM GROQ RESPONSE
 # ============================================================
 
@@ -3056,6 +3081,242 @@ def build_context_from_serpapi(
     context_text = "\n\n".join(parts)[:SERPAPI_CONTEXT_CHAR_LIMIT]
 
     return context_text, sources
+
+
+# ============================================================
+# WIKIPEDIA API (free, no key needed)
+# ============================================================
+
+def wikipedia_search(
+    topic,
+    num_results=None,
+    lang=None
+):
+    """
+    MediaWiki API (generator=search) से किसी topic पर सबसे relevant
+    Wikipedia pages लाता है, हर page का plain-text extract (summary) समेत।
+    कोई API key नहीं चाहिए — Wikipedia का API हमेशा free रहा है।
+    """
+
+    lang = (lang or WIKIPEDIA_LANG).strip() or "hi"
+
+    num_results = int(
+        num_results or WIKIPEDIA_RESULTS_COUNT
+    )
+
+    num_results = max(
+        1,
+        min(num_results, 10)
+    )
+
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": topic,
+        "gsrlimit": num_results,
+        "prop": "extracts",
+        "exintro": 1,
+        "explaintext": 1,
+        "format": "json",
+        "redirects": 1,
+    }
+
+    headers = {
+        "User-Agent": (
+            "TelegramQuizBot/1.0 "
+            "(educational MCQ generation)"
+        )
+    }
+
+    try:
+
+        response = requests.get(
+            f"https://{lang}.wikipedia.org/w/api.php",
+            params=params,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+    except Exception:
+
+        logger.exception(
+            "Wikipedia request failed (lang=%s): %s",
+            lang,
+            topic
+        )
+
+        raise RuntimeError(
+            "Wikipedia से data नहीं मिल सका।"
+        )
+
+    pages = (
+        payload.get("query", {}).get("pages", {})
+        if isinstance(payload, dict)
+        else {}
+    )
+
+    results = []
+
+    for page in pages.values():
+
+        title = normalize_text(
+            page.get("title") or ""
+        )
+
+        extract = normalize_text(
+            page.get("extract") or ""
+        )
+
+        if not (title and extract):
+            continue
+
+        url = (
+            f"https://{lang}.wikipedia.org/wiki/"
+            f"{title.replace(' ', '_')}"
+        )
+
+        results.append({
+            "title": title,
+            "extract": extract,
+            "url": url,
+        })
+
+    # अगर चुनी हुई भाषा (जैसे hi) में कुछ न मिले, तो अंग्रेज़ी Wikipedia
+    # पर एक बार और कोशिश करते हैं — इससे नए/कम-कवर topics भी मिल जाते हैं।
+    if not results and lang != "en":
+        return wikipedia_search(
+            topic,
+            num_results=num_results,
+            lang="en"
+        )
+
+    return results[:num_results]
+
+
+def build_context_from_wikipedia(
+    topic,
+    num_results=None,
+    lang=None
+):
+    """
+    किसी topic के लिए Wikipedia extracts से एक combined context text
+    बनाता है, जो groq_generate_questions() को context_text के रूप में
+    दिया जा सके।
+    """
+
+    results = wikipedia_search(
+        topic,
+        num_results=num_results,
+        lang=lang,
+    )
+
+    if not results:
+        return "", []
+
+    parts = []
+    sources = []
+
+    for idx, item in enumerate(results):
+
+        block = (
+            f"Source {idx + 1}: {item['title']}\n"
+            f"{item['extract']}"
+        )
+
+        parts.append(block)
+        sources.append(item["url"])
+
+    context_text = "\n\n".join(parts)[:WIKIPEDIA_CONTEXT_CHAR_LIMIT]
+
+    return context_text, sources
+
+
+# ============================================================
+# GOOGLE CLOUD TEXT-TO-SPEECH
+# ============================================================
+
+def google_tts_synthesize(
+    text,
+    lang_code=None,
+    voice_name=None,
+    audio_encoding="OGG_OPUS"
+):
+    """
+    Google Cloud Text-to-Speech REST API से text को audio bytes में बदलता
+    है (/speak command के लिए)। Telegram voice notes के लिए OGG_OPUS
+    (default) चाहिए होता है; MP3 भी चाहें तो दे सकते हैं।
+    """
+
+    if not GOOGLE_TTS_API_KEY:
+        raise RuntimeError(
+            "GOOGLE_TTS_API_KEY configured नहीं है।"
+        )
+
+    text = str(text or "").strip()
+
+    if not text:
+        raise RuntimeError(
+            "Convert करने के लिए text खाली है।"
+        )
+
+    text = text[:GOOGLE_TTS_CHAR_LIMIT]
+
+    lang_code = (
+        lang_code
+        or GOOGLE_TTS_LANGUAGE_CODE
+        or "hi-IN"
+    )
+
+    voice = {"languageCode": lang_code}
+
+    voice_name = voice_name or GOOGLE_TTS_VOICE_NAME
+
+    if voice_name:
+        voice["name"] = voice_name
+
+    body = {
+        "input": {"text": text},
+        "voice": voice,
+        "audioConfig": {"audioEncoding": audio_encoding},
+    }
+
+    try:
+
+        response = requests.post(
+            "https://texttospeech.googleapis.com/v1/text:synthesize",
+            params={"key": GOOGLE_TTS_API_KEY},
+            json=body,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        payload = response.json()
+
+    except Exception:
+
+        logger.exception(
+            "Google TTS request failed"
+        )
+
+        raise RuntimeError(
+            "Google TTS से audio नहीं बन सका।"
+        )
+
+    audio_b64 = payload.get("audioContent") if isinstance(payload, dict) else None
+
+    if not audio_b64:
+        raise RuntimeError(
+            "Google TTS ने कोई audio नहीं लौटाया।"
+        )
+
+    import base64 as _base64
+
+    return _base64.b64decode(audio_b64)
 
 
 # ============================================================
@@ -5990,8 +6251,17 @@ SerpAPI web-search + AI से quiz अपने आप बनाकर शु�
 /newsquiz [COUNT] TOPIC
 SerpAPI Google News से current-affairs quiz अपने आप बनाकर शुरू करें
 
+/wikiquiz [COUNT] TOPIC
+Wikipedia से factual/history/polity quiz अपने आप बनाकर शुरू करें
+
 /websearch QUERY
 Quiz बनाए बिना सिर्फ SerpAPI results देखें
+
+/scrape SOURCE [COUNT]
+Saved website source (rajras/rbse/ncert आदि) से quiz बनाकर शुरू करें
+
+/speak TEXT
+Text को voice note में बदलें (Google TTS)
 
 /scrape SOURCE
 Website से content लेकर questions बनाएं
@@ -7633,6 +7903,281 @@ async def newsquiz_command(update, context):
 
 
 # ============================================================
+# WIKIQUIZ COMMAND (WIKIPEDIA + AI GENERATION)
+# ============================================================
+
+async def wikiquiz_command(update, context):
+    """
+    /wikiquiz [COUNT] TOPIC
+
+    Wikipedia (free, no key) से topic पर summary उठाता है, उसी context
+    पर Groq से MCQ बनाता है और quiz तुरंत शुरू कर देता है — /autoquiz की
+    तरह ही, पर source Wikipedia है (encyclopedic/factual topics: history,
+    polity, geography, science वगैरह के लिए ज़्यादा भरोसेमंद)।
+    """
+
+    if not await require_admin(update):
+        return
+
+    if groq_client is None:
+        await update.message.reply_text(
+            "GROQ_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n\n"
+            "/wikiquiz [COUNT] TOPIC\n\n"
+            "Examples:\n"
+            "/wikiquiz Rajasthan History\n"
+            "/wikiquiz 15 Indian Constitution"
+        )
+        return
+
+    args = list(context.args)
+
+    count = DEFAULT_QUIZ_COUNT
+
+    if args and args[0].isdigit():
+        count = int(args[0])
+        args = args[1:]
+
+    count = max(
+        1,
+        min(count, MAX_IMPORT_QUESTIONS)
+    )
+
+    topic = " ".join(args).strip()
+
+    if not topic:
+        await update.message.reply_text(
+            "Topic देना जरूरी है।\n\n"
+            "Example:\n"
+            "/wikiquiz 10 Rajasthan History"
+        )
+        return
+
+    await update.message.reply_text(
+        f"📖 Wikipedia से \"{topic}\" पर जानकारी लाई जा रही है...\n"
+        f"इसके बाद AI {count} questions generate करेगा और quiz अपने आप शुरू हो जाएगा।\n"
+        "कृपया प्रतीक्षा करें..."
+    )
+
+    try:
+
+        context_text, sources = await asyncio.to_thread(
+            build_context_from_wikipedia,
+            topic,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Wikipedia search failed for wikiquiz: %s",
+            topic
+        )
+
+        await update.message.reply_text(
+            "Wikipedia search में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not context_text:
+        await update.message.reply_text(
+            "इस topic के लिए Wikipedia पर कोई page नहीं मिला।\n"
+            "कृपया topic थोड़ा अलग तरीके से लिखकर दोबारा try करें।"
+        )
+        return
+
+    try:
+
+        questions = await asyncio.to_thread(
+            groq_generate_questions,
+            topic,
+            count,
+            context_text,
+            "wikipedia",
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "AI generation from Wikipedia context failed: %s",
+            topic
+        )
+
+        await update.message.reply_text(
+            "AI question generation में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    if not questions:
+        await update.message.reply_text(
+            "AI से कोई valid question प्राप्त नहीं हुआ।\n"
+            "कृपया दोबारा try करें या topic बदलें।"
+        )
+        return
+
+    added = 0
+    duplicate = 0
+    failed = 0
+    new_ids = []
+
+    for question in questions:
+
+        try:
+
+            question_id, status = add_question(
+                question
+            )
+
+            if question_id and status == "added":
+                added += 1
+                new_ids.append(question_id)
+            elif question_id and status == "duplicate":
+                duplicate += 1
+            else:
+                failed += 1
+
+        except Exception:
+
+            logger.exception(
+                "Question save failed (wikiquiz)"
+            )
+
+            failed += 1
+
+    if not new_ids:
+        await update.message.reply_text(
+            "Questions generate हुए लेकिन सभी duplicate/invalid निकले।\n"
+            f"Generated: {len(questions)} | Duplicate: {duplicate} | Failed: {failed}"
+        )
+        return
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=f"WikiQuiz: {topic}"[:100],
+        question_ids=new_ids,
+    )
+
+    if not quiz_id:
+        await update.message.reply_text(
+            "Questions बन गए, लेकिन Quiz create नहीं हो सका।"
+        )
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+        await update.message.reply_text(
+            "Quiz में questions नहीं मिले।"
+        )
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    source_note = ""
+
+    if sources:
+        top_sources = "\n".join(f"• {link}" for link in sources[:3])
+        source_note = f"\n\nWikipedia sources:\n{top_sources}"
+
+    await update.message.reply_text(
+        "✅ WikiQuiz तैयार है।\n\n"
+        f"Topic: {topic}\n"
+        f"Generated: {len(questions)}\n"
+        f"Added: {added}\n"
+        f"Duplicate: {duplicate}\n"
+        f"Failed: {failed}\n"
+        f"Quiz ID: {quiz_id}"
+        f"{source_note}\n\n"
+        "पहला question शुरू हो रहा है..."
+    )
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
+    )
+
+
+# ============================================================
+# SPEAK COMMAND (GOOGLE CLOUD TTS)
+# ============================================================
+
+async def speak_command(update, context):
+    """
+    /speak TEXT
+
+    Google Cloud Text-to-Speech से दिया गया text एक voice note में बदलकर
+    Telegram पर भेजता है। हिंदी exam-content सुनकर revise करने के लिए उपयोगी।
+    """
+
+    if not GOOGLE_TTS_API_KEY:
+        await update.message.reply_text(
+            "GOOGLE_TTS_API_KEY environment variable set नहीं है।"
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n\n"
+            "/speak TEXT\n\n"
+            "Example:\n"
+            "/speak राजस्थान का सबसे बड़ा जिला जैसलमेर है।"
+        )
+        return
+
+    text = " ".join(context.args).strip()
+
+    if len(text) > GOOGLE_TTS_CHAR_LIMIT:
+        await update.message.reply_text(
+            f"Text बहुत लंबा है (अधिकतम {GOOGLE_TTS_CHAR_LIMIT} characters)। "
+            "कृपया छोटा करके भेजें।"
+        )
+        return
+
+    try:
+
+        audio_bytes = await asyncio.to_thread(
+            google_tts_synthesize,
+            text,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Google TTS synthesis failed"
+        )
+
+        await update.message.reply_text(
+            "Audio बनाने में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+
+        return
+
+    from io import BytesIO
+
+    audio_file = BytesIO(audio_bytes)
+    audio_file.name = "speech.ogg"
+
+    await update.message.reply_voice(
+        voice=audio_file,
+        caption=text[:200],
+    )
+
+
+# ============================================================
 # SCRAPE COMMAND
 # ============================================================
 
@@ -7645,13 +8190,15 @@ async def scrape_command(update, context):
 
         await update.message.reply_text(
             "Usage:\n\n"
-            "/scrape SOURCE\n\n"
+            "/scrape SOURCE [COUNT]\n\n"
             "Available sources:\n"
             "rajras\n"
             "rbse\n"
             "samyak_rbse\n"
             "ncert\n"
-            "online2study"
+            "online2study\n\n"
+            "Example:\n"
+            "/scrape rajras 15"
         )
 
         return
@@ -7660,6 +8207,16 @@ async def scrape_command(update, context):
         context.args[0]
         .strip()
         .lower()
+    )
+
+    count = DEFAULT_QUIZ_COUNT
+
+    if len(context.args) > 1 and context.args[1].isdigit():
+        count = int(context.args[1])
+
+    count = max(
+        1,
+        min(count, MAX_IMPORT_QUESTIONS)
     )
 
     conn = db()
@@ -7693,13 +8250,17 @@ async def scrape_command(update, context):
     await update.message.reply_text(
         f"Source scrape किया जा रहा है:\n"
         f"{source_name}\n\n"
+        f"AI {count} questions generate करेगा और quiz अपने आप शुरू हो जाएगा।\n"
         "यह process थोड़ा समय ले सकता है।"
     )
 
     try:
 
-        result = scrape_and_generate(
-            source_name
+        result = await asyncio.to_thread(
+            scrape_and_generate,
+            source_name,
+            None,
+            count,
         )
 
     except Exception:
@@ -7751,35 +8312,60 @@ async def scrape_command(update, context):
 
             failed += 1
 
-    summary_lines = [
-        "Scraping Complete",
-        "",
-        f"Source: {source_name}",
-        f"Generated: {len(result)}",
-        f"Added: {added}",
-        f"Duplicate: {duplicate}",
-        f"Failed: {failed}",
-    ]
+    if not new_ids:
 
-    if new_ids:
-
-        quiz_id = create_quiz_from_question_ids(
-            user_id=update.effective_user.id,
-            title=f"Source: {source_name}",
-            question_ids=new_ids,
+        await update.message.reply_text(
+            "Questions generate हुए लेकिन सभी duplicate/invalid निकले।\n"
+            f"Generated: {len(result)} | Duplicate: {duplicate} | Failed: {failed}"
         )
 
-        if quiz_id:
+        return
 
-            summary_lines += [
-                "",
-                f"Quiz बन गया (Quiz ID: {quiz_id})",
-                f"Start करने के लिए:",
-                f"/quizid {quiz_id}",
-            ]
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=f"Source: {source_name}"[:100],
+        question_ids=new_ids,
+    )
+
+    if not quiz_id:
+
+        await update.message.reply_text(
+            "Questions बन गए, लेकिन Quiz create नहीं हो सका।"
+        )
+
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+
+        await update.message.reply_text(
+            "Quiz में questions नहीं मिले।"
+        )
+
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
 
     await update.message.reply_text(
-        "\n".join(summary_lines)
+        "✅ Scraping पूरी हुई, Quiz तैयार है।\n\n"
+        f"Source: {source_name}\n"
+        f"Generated: {len(result)}\n"
+        f"Added: {added}\n"
+        f"Duplicate: {duplicate}\n"
+        f"Failed: {failed}\n"
+        f"Quiz ID: {quiz_id}\n\n"
+        "पहला question शुरू हो रहा है..."
+    )
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
     )
 
 
@@ -10382,6 +10968,20 @@ def build_application():
         CommandHandler(
             "newsquiz",
             newsquiz_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "wikiquiz",
+            wikiquiz_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "speak",
+            speak_command
         )
     )
 
