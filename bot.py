@@ -95,8 +95,17 @@ GROQ_MODEL = os.getenv(
 # Scanned/image PDF OCR model. Override with GROQ_VISION_MODEL if needed.
 GROQ_VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL",
+    "qwen/qwen3.8-27b"
+)
+
+# Primary model "model_not_found" दे तो ये (comma-separated) models क्रम से आज़माए जाएँगे.
+GROQ_VISION_FALLBACK_MODELS = os.getenv(
+    "GROQ_VISION_FALLBACK_MODELS",
     "qwen/qwen3.6-27b"
 )
+
+# एक request में images की संख्या (qwen3.8 max 3, qwen3.6 max 5).
+GROQ_VISION_BATCH = int(os.getenv("GROQ_VISION_BATCH", "3"))
 
 # DeepSeek fallback: agar Groq fail ho jaye to MCQ generation automatically
 # DeepSeek se hoga. DEEPSEEK_API_KEY set na ho to fallback band rehta hai.
@@ -3667,6 +3676,51 @@ def _ocr_pdf_with_ocrmypdf(file_path):
                 pass
 
 
+def _groq_vision_complete(content):
+    """Vision OCR call: primary model न मिले तो fallback models आज़माता है।"""
+    if groq_client is None:
+        raise RuntimeError("GROQ_API_KEY configured नहीं है।")
+
+    models = []
+    for name in [GROQ_VISION_MODEL] + GROQ_VISION_FALLBACK_MODELS.split(","):
+        name = name.strip()
+        if name and name not in models:
+            models.append(name)
+
+    last_error = None
+
+    for model in models:
+        try:
+            response = groq_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "आप एक high-accuracy OCR assistant हैं। केवल source की text लौटाएं।",
+                    },
+                    {"role": "user", "content": content},
+                ],
+                temperature=0,
+                max_tokens=12000,
+            )
+            text = response.choices[0].message.content or ""
+            # thinking models कभी <think>...</think> भी लौटाते हैं; उसे हटाएँ
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+            return text.strip()
+
+        except Exception as exc:
+            last_error = exc
+            msg = str(exc).lower()
+            if any(k in msg for k in (
+                "model_not_found", "does not exist", "decommission", "no access"
+            )):
+                logger.warning("Groq vision model %s उपलब्ध नहीं: %s", model, exc)
+                continue
+            raise
+
+    raise last_error or RuntimeError("कोई Groq vision model उपलब्ध नहीं।")
+
+
 def _image_mime(data):
     """Bytes की शुरुआत देखकर image का MIME type बताता है।"""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -3687,7 +3741,7 @@ def _ocr_images_with_groq(images):
     import base64
 
     chunks = []
-    batch_size = 4
+    batch_size = max(1, GROQ_VISION_BATCH)
 
     for start in range(0, len(images), batch_size):
         content = [
@@ -3707,16 +3761,7 @@ def _ocr_images_with_groq(images):
                 "image_url": {"url": f"data:{_image_mime(data)};base64,{image_b64}"},
             })
 
-        response = groq_client.chat.completions.create(
-            model=GROQ_VISION_MODEL,
-            messages=[
-                {"role": "system", "content": "आप एक high-accuracy OCR assistant हैं। केवल source की text लौटाएं।"},
-                {"role": "user", "content": content},
-            ],
-            temperature=0,
-            max_tokens=12000,
-        )
-        text = response.choices[0].message.content or ""
+        text = _groq_vision_complete(content)
         if text.strip():
             chunks.append(text.strip())
 
@@ -3741,7 +3786,7 @@ def _ocr_pdf_with_groq(file_path, max_pages=None):
         chunks = []
 
         # Groq vision requests can accept multiple images. Keep batches small for reliability.
-        batch_size = 5
+        batch_size = max(1, GROQ_VISION_BATCH)
         for batch_start in range(0, page_limit, batch_size):
             content = [
                 {
@@ -3762,16 +3807,7 @@ def _ocr_pdf_with_groq(file_path, max_pages=None):
                     "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"},
                 })
 
-            response = groq_client.chat.completions.create(
-                model=GROQ_VISION_MODEL,
-                messages=[
-                    {"role": "system", "content": "आप एक high-accuracy OCR assistant हैं। केवल source की text लौटाएं।"},
-                    {"role": "user", "content": content},
-                ],
-                temperature=0,
-                max_tokens=12000,
-            )
-            text = response.choices[0].message.content or ""
+            text = _groq_vision_complete(content)
             if text.strip():
                 chunks.append(text.strip())
 
