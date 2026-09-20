@@ -2728,7 +2728,8 @@ def groq_generate_questions(
     topic,
     count=10,
     context_text="",
-    source=""
+    source="",
+    style=""
 ):
 
     if not ai_available():
@@ -2752,6 +2753,12 @@ def groq_generate_questions(
     context_text = str(
         context_text or ""
     )[:30000]
+
+    style_block = (
+        "\nप्रश्न-शैली के अतिरिक्त नियम (ये ऊपर के नियमों के साथ भी लागू हैं):\n"
+        + str(style).strip()
+        + "\n"
+    ) if style else ""
 
     prompt = f"""
 आप एक परीक्षा प्रश्न निर्माण विशेषज्ञ हैं।
@@ -2786,7 +2793,7 @@ subject
 6. दिए गए context का उपयोग करें।
 7. कोई अतिरिक्त text न दें।
 8. केवल JSON array दें।
-
+{style_block}
 Format:
 
 [
@@ -5282,10 +5289,27 @@ async def send_quiz_question(
         or get_quiz_time()
     )
 
-    question_text = (
+    full_question = (
         f"प्रश्न {index}/{total}\n\n"
         f"{question['question']}"
-    )[:290]
+    )
+
+    if len(full_question) > 290:
+        # Poll में प्रश्न 300 अक्षर तक ही आता है; लंबा प्रश्न (कथन/कारण/कालक्रम)
+        # पहले अलग message में पूरा भेजें
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=full_question[:4000]
+            )
+        except Exception:
+            logger.exception("Long question message failed")
+
+        question_text = (
+            f"प्रश्न {index}/{total}: ऊपर दिए गए प्रश्न का सही उत्तर चुनें"
+        )
+    else:
+        question_text = full_question
 
     message = await context.bot.send_poll(
         chat_id=chat_id,
@@ -6678,6 +6702,9 @@ AI से questions बनाएं
 
 /exams
 Database में उपलब्ध exam नाम देखें (/exam के लिए)
+
+/rpsc [TYPE] [COUNT] TOPIC
+RPSC पैटर्न प्रश्न: कथन, कथन-कारण, कालक्रम, सुमेलन (जैसे /rpsc karan 10 राजस्थान इतिहास)
 
 /syllabustest EXAM [COUNT]
 Saved sources + syllabus के अनुसार पूरा test बनाएं (जैसे /syllabustest RAS 100)
@@ -8401,6 +8428,268 @@ async def syllabustest_command(update, context):
 
     if failed_subjects:
         summary.append("Fail हुए subjects: " + ", ".join(failed_subjects))
+
+    summary += ["", "पहला question शुरू हो रहा है..."]
+
+    await message.reply_text("\n".join(summary))
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
+    )
+
+
+# ============================================================
+# RPSC PATTERN QUESTIONS (/rpsc)
+# ============================================================
+# कथन आधारित, कथन-कारण, कालक्रम, सुमेलन जैसे RPSC/RAS प्रारंभिक परीक्षा
+# शैली के प्रश्न. ये शैलियाँ परीक्षा में आम हैं, कोई आधिकारिक template नहीं.
+
+RPSC_COMMON_RULES = """- कठिनाई RPSC RAS प्रारंभिक परीक्षा के स्तर की और विश्लेषणात्मक हो।
+- तथ्य सही हों; कोई तथ्य पक्का न हो तो वह प्रश्न न बनाएं।
+- question में पूरा प्रश्न (कथन/सूचियों सहित) नई पंक्तियों के साथ लिखें; कुल 900 अक्षरों के भीतर।
+- हर option 90 अक्षरों के भीतर हो।
+- सही उत्तर A, B, C, D में बदल-बदल कर रखें (हर बार A नहीं)।
+- explanation में सही उत्तर का कारण संक्षेप में (लगभग 200 अक्षर) दें।
+- context दिया हो तो तथ्य उसी से लें।"""
+
+RPSC_STYLES = {
+    "kathan": (
+        "शैली: कथन आधारित।\n"
+        "- question की शुरुआत \"निम्नलिखित कथनों पर विचार कीजिए:\" से हो, फिर कथन 1, 2 और 3 "
+        "अलग-अलग पंक्तियों में, और अंत में \"उपर्युक्त में से कौन-सा/से कथन सही है/हैं?\"\n"
+        "- कुछ कथन सही हों और कुछ सूक्ष्म रूप से गलत (नाम, तिथि या स्थान बदला हुआ)।\n"
+        "- options केवल संयोजन हों, जैसे \"केवल 1\", \"केवल 1 और 2\", \"केवल 2 और 3\", \"1, 2 और 3\" (चारों अलग)।"
+    ),
+    "karan": (
+        "शैली: कथन-कारण (अभिकथन-कारण)।\n"
+        "- question में \"अभिकथन (A): ...\" और \"कारण (R): ...\" अलग पंक्तियों में हों, "
+        "अंत में \"नीचे दिए गए कूट से सही उत्तर चुनिए:\"\n"
+        "- options हमेशा ठीक इसी क्रम में हों:\n"
+        "  option_a: A और R दोनों सत्य हैं और R, A की सही व्याख्या है\n"
+        "  option_b: A और R दोनों सत्य हैं, किन्तु R, A की सही व्याख्या नहीं है\n"
+        "  option_c: A सत्य है, किन्तु R असत्य है\n"
+        "  option_d: A असत्य है, किन्तु R सत्य है\n"
+        "- चारों तरह के उत्तर मिला-जुलाकर रखें।"
+    ),
+    "kalkram": (
+        "शैली: कालक्रम।\n"
+        "- question की शुरुआत \"निम्नलिखित घटनाओं को कालक्रमानुसार (प्राचीन से नवीन) व्यवस्थित कीजिए:\" "
+        "से हो, फिर 1, 2, 3, 4 अलग-अलग पंक्तियों में, अंत में \"नीचे दिए गए कूट से सही उत्तर चुनिए:\"\n"
+        "- options क्रम के रूप में हों, जैसे \"2, 1, 4, 3\" (चारों अलग)।\n"
+        "- घटनाओं की तिथियाँ/क्रम पूरी तरह सही हों।"
+    ),
+    "sumel": (
+        "शैली: सुमेलन।\n"
+        "- question में \"सूची-I को सूची-II से सुमेलित कीजिए और नीचे दिए गए कूट से सही उत्तर चुनिए:\" "
+        "लिखें, फिर सूची-I (A, B, C, D) और सूची-II (1, 2, 3, 4) अलग पंक्तियों में।\n"
+        "- options मिलान-संयोजन हों, जैसे \"A-2, B-1, C-4, D-3\" (चारों अलग)।"
+    ),
+    "kitne": (
+        "शैली: कितने कथन सही हैं।\n"
+        "- question में 3 कथन लिखें और अंत में \"उपर्युक्त में से कितने कथन सही हैं?\"\n"
+        "- options: \"केवल एक\", \"केवल दो\", \"सभी तीन\", \"कोई नहीं\" (उत्तर बदल-बदल कर)।"
+    ),
+}
+
+RPSC_LABELS = {
+    "kathan": "कथन आधारित",
+    "karan": "कथन-कारण",
+    "kalkram": "कालक्रम",
+    "sumel": "सुमेलन",
+    "kitne": "कितने कथन सही",
+    "mix": "मिश्रित (सभी प्रकार)",
+}
+
+RPSC_ALIASES = {
+    "kathan": "kathan", "statement": "kathan",
+    "karan": "karan", "kathankaran": "karan", "assertion": "karan", "ar": "karan",
+    "kalkram": "kalkram", "kaalkram": "kalkram", "chrono": "kalkram",
+    "sumel": "sumel", "match": "sumel", "matching": "sumel",
+    "kitne": "kitne", "count": "kitne",
+    "mix": "mix", "mixed": "mix",
+}
+
+RPSC_MIX_WEIGHTS = [
+    ["kathan", "", 3],
+    ["karan", "", 3],
+    ["kalkram", "", 2],
+    ["sumel", "", 2],
+    ["kitne", "", 2],
+]
+
+
+def _parse_rpsc_args(args):
+    """/rpsc [type] [count] [topic] -> (style, count, topic)"""
+    args = list(args or [])
+
+    style = "mix"
+
+    if args and args[0].lower() in RPSC_ALIASES:
+        style = RPSC_ALIASES[args.pop(0).lower()]
+
+    count = None
+
+    if args and args[0].isdigit():
+        count = int(args.pop(0))
+
+    if count is None:
+        count = 20 if style == "mix" else 10
+
+    count = max(1, min(count, 50 if style == "mix" else 25))
+
+    topic = " ".join(args).strip() or "RPSC RAS सामान्य ज्ञान (राजस्थान सहित)"
+
+    return style, count, topic
+
+
+async def rpsc_command(update, context):
+    """/rpsc [TYPE] [COUNT] TOPIC: RPSC पैटर्न के प्रश्न बनाकर quiz शुरू करें."""
+
+    if not await require_admin(update):
+        return
+
+    message = update.message
+
+    if not message:
+        return
+
+    if not ai_available():
+        await message.reply_text(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
+        )
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "RPSC पैटर्न के प्रश्न बनाने के लिए:\n\n"
+            "/rpsc [TYPE] [COUNT] TOPIC\n\n"
+            "TYPE:\n"
+            "kathan - कथन आधारित\n"
+            "karan - कथन-कारण\n"
+            "kalkram - कालक्रम\n"
+            "sumel - सुमेलन\n"
+            "kitne - कितने कथन सही\n"
+            "mix - सभी मिलाकर (default)\n\n"
+            "Examples:\n"
+            "/rpsc karan 10 राजस्थान का इतिहास\n"
+            "/rpsc kalkram 8 भारत का स्वतंत्रता आंदोलन\n"
+            "/rpsc mix 30 राजस्थान का भूगोल"
+        )
+        return
+
+    style, count, topic = _parse_rpsc_args(context.args)
+
+    if style == "mix":
+        rows = RPSC_MIX_WEIGHTS[:max(1, min(count, len(RPSC_MIX_WEIGHTS)))]
+        plan = list(zip([r[0] for r in rows], _allocate_counts(rows, count)))
+    else:
+        plan = [(style, count)]
+
+    status = await message.reply_text(
+        f"📝 RPSC पैटर्न: {RPSC_LABELS[style]}\n"
+        f"Topic: {topic}\n"
+        f"Questions: {count}\n\n"
+        "AI प्रश्न बना रहा है, कृपया प्रतीक्षा करें..."
+    )
+
+    domains = await asyncio.to_thread(_source_domains)
+    ctx_text = await asyncio.to_thread(
+        _syllabus_context, f"{topic} RPSC RAS", domains
+    )
+
+    new_ids = []
+    duplicate = 0
+    failed_types = []
+    lines = []
+
+    for style_key, n in plan:
+
+        try:
+            generated = await asyncio.to_thread(
+                groq_generate_questions,
+                f"{topic} - {RPSC_LABELS[style_key]} प्रश्न (RPSC RAS पैटर्न)",
+                n,
+                ctx_text,
+                f"rpsc-{style_key}",
+                RPSC_STYLES[style_key] + "\n" + RPSC_COMMON_RULES,
+            )
+        except Exception:
+            logger.exception("RPSC generation failed: %s", style_key)
+            failed_types.append(RPSC_LABELS[style_key])
+            continue
+
+        added_here = 0
+
+        for question in generated or []:
+            try:
+                question["exam"] = "RPSC"
+                question["subject"] = topic[:60]
+                question["source"] = f"rpsc-{style_key}"
+                question_id, result = add_question(question)
+
+                if question_id and result == "added":
+                    new_ids.append(question_id)
+                    added_here += 1
+                elif question_id and result == "duplicate":
+                    duplicate += 1
+            except Exception:
+                logger.exception("RPSC question save failed")
+
+        lines.append(f"✓ {RPSC_LABELS[style_key]}: {added_here}/{n}")
+
+        try:
+            await status.edit_text(
+                f"📝 RPSC प्रश्न बन रहे हैं...\n\n" + "\n".join(lines)
+            )
+        except Exception:
+            pass
+
+    if not new_ids:
+        await message.reply_text(
+            "कोई नया question नहीं बन सका।\n"
+            f"Duplicate: {duplicate} | Failed: {len(failed_types)}\n"
+            "सही कारण server logs में है।"
+        )
+        return
+
+    import random as _random
+    _random.shuffle(new_ids)
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=f"RPSC {RPSC_LABELS[style]}: {topic}"[:100],
+        question_ids=new_ids,
+        exam="RPSC",
+    )
+
+    if not quiz_id:
+        await message.reply_text("Questions बन गए, पर Quiz create नहीं हो सका।")
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+        await message.reply_text("Quiz में questions नहीं मिले।")
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    summary = [
+        "✅ RPSC पैटर्न quiz तैयार है।",
+        "",
+        f"Questions: {len(new_ids)}",
+        f"Duplicate छोड़े गए: {duplicate}",
+        f"Quiz ID: {quiz_id}  (दोबारा: /quizid {quiz_id} retry)",
+    ]
+
+    if failed_types:
+        summary.append("Fail हुए प्रकार: " + ", ".join(failed_types))
 
     summary += ["", "पहला question शुरू हो रहा है..."]
 
@@ -12006,6 +12295,13 @@ def build_application():
         CommandHandler(
             "syllabustest",
             syllabustest_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "rpsc",
+            rpsc_command
         )
     )
 
