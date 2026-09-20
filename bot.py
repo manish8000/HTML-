@@ -114,6 +114,12 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "de
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
 DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "120"))
 
+# Keep-alive: Koyeb free instance 1 घंटे बिना traffic के sleep हो जाता है.
+# KEEPALIVE_URL = service का public URL (जैसे https://myapp-xxx.koyeb.app).
+# खाली हो तो KOYEB_PUBLIC_DOMAIN (Koyeb खुद देता है) इस्तेमाल होता है.
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL", "").strip()
+KEEPALIVE_INTERVAL = int(os.getenv("KEEPALIVE_INTERVAL", "240"))
+
 # Photo-to-quiz: फ़ोटो भेजने पर Groq vision से text पढ़कर quiz बनता है.
 PHOTO_QUIZ_MAX_IMAGES = int(os.getenv("PHOTO_QUIZ_MAX_IMAGES", "8"))
 PHOTO_GROUP_WAIT_SECONDS = float(os.getenv("PHOTO_GROUP_WAIT_SECONDS", "2.5"))
@@ -266,6 +272,54 @@ def run_health_server():
             "Health server error: %s",
             e
         )
+
+
+def _keepalive_target():
+    """Keep-alive ping का URL बनाता है (खाली string = बंद)."""
+    url = KEEPALIVE_URL
+
+    if not url:
+        domain = os.getenv("KOYEB_PUBLIC_DOMAIN", "").strip()
+        if domain:
+            url = f"https://{domain}"
+
+    if not url:
+        return ""
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    return url.rstrip("/") + "/health"
+
+
+def run_keepalive_loop():
+    """Public URL पर समय-समय पर request भेजता है, ताकि service sleep न हो."""
+    target = _keepalive_target()
+
+    if not target:
+        logger.warning(
+            "KEEPALIVE_URL सेट नहीं है; self-ping बंद है। "
+            "Koyeb sleep रोकने के लिए KEEPALIVE_URL डालें या UptimeRobot इस्तेमाल करें।"
+        )
+        return
+
+    interval = max(60, KEEPALIVE_INTERVAL)
+
+    logger.info(
+        "Keep-alive शुरू: %s हर %s सेकंड में",
+        target,
+        interval
+    )
+
+    time.sleep(60)  # server के चालू होने का इंतज़ार
+
+    while True:
+        try:
+            requests.get(target, timeout=20)
+        except Exception as e:
+            logger.warning("Keep-alive ping fail: %s", e)
+
+        time.sleep(interval)
 
 
 # ============================================================
@@ -11894,6 +11948,12 @@ def main():
         "Health server started on port %s",
         PORT
     )
+
+    threading.Thread(
+        target=run_keepalive_loop,
+        daemon=True,
+        name="keepalive"
+    ).start()
 
     application = build_application()
 
