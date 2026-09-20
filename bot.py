@@ -105,6 +105,10 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "de
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
 DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "120"))
 
+# Photo-to-quiz: फ़ोटो भेजने पर Groq vision से text पढ़कर quiz बनता है.
+PHOTO_QUIZ_MAX_IMAGES = int(os.getenv("PHOTO_QUIZ_MAX_IMAGES", "8"))
+PHOTO_GROUP_WAIT_SECONDS = float(os.getenv("PHOTO_GROUP_WAIT_SECONDS", "2.5"))
+
 # OCRmyPDF (Tesseract) settings: scanned PDF ke liye free, offline OCR.
 # Server par `ocrmypdf` + tesseract hin/eng install hona chahiye.
 OCRMYPDF_ENABLED = os.getenv("OCRMYPDF_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -3663,6 +3667,62 @@ def _ocr_pdf_with_ocrmypdf(file_path):
                 pass
 
 
+def _image_mime(data):
+    """Bytes की शुरुआत देखकर image का MIME type बताता है।"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _ocr_images_with_groq(images):
+    """फ़ोटो (bytes की list) से Groq vision द्वारा text पढ़ता है।
+
+    Fail होने पर exception raise करता है, ताकि user को कारण दिख सके।
+    """
+    if groq_client is None:
+        raise RuntimeError("GROQ_API_KEY configured नहीं है।")
+
+    import base64
+
+    chunks = []
+    batch_size = 4
+
+    for start in range(0, len(images), batch_size):
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "इन फ़ोटो में लिखा पूरा readable text हिंदी/अंग्रेजी में ज्यों का त्यों निकालें। "
+                    "फ़ोटो का क्रम बनाए रखें। कोई summary, व्याख्या या MCQ न बनाएं; केवल OCR text दें।"
+                ),
+            }
+        ]
+
+        for data in images[start:start + batch_size]:
+            image_b64 = base64.b64encode(data).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{_image_mime(data)};base64,{image_b64}"},
+            })
+
+        response = groq_client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
+            messages=[
+                {"role": "system", "content": "आप एक high-accuracy OCR assistant हैं। केवल source की text लौटाएं।"},
+                {"role": "user", "content": content},
+            ],
+            temperature=0,
+            max_tokens=12000,
+        )
+        text = response.choices[0].message.content or ""
+        if text.strip():
+            chunks.append(text.strip())
+
+    return "\n\n".join(chunks)
+
+
 def _ocr_pdf_with_groq(file_path, max_pages=None):
     """OCR image/scanned PDF pages with Groq vision when PyMuPDF is installed."""
     if groq_client is None:
@@ -6404,6 +6464,9 @@ AI से questions बनाएं
 /textquiz TEXT
 आपके भेजे text से AI (Groq/DeepSeek) quiz बनाए (या किसी message को reply करके /textquiz)
 
+/photoquiz
+फ़ोटो से quiz: private chat में सीधे फ़ोटो भेजें, या फ़ोटो पर reply करके /photoquiz
+
 /autoquiz [COUNT] TOPIC
 SerpAPI web-search + AI से quiz अपने आप बनाकर शुरू करें
 
@@ -7558,7 +7621,7 @@ async def generate_command(update, context):
 TEXTQUIZ_MIN_CHARS = 40
 
 
-async def _run_text_quiz(update, context, text):
+async def _run_text_quiz(update, context, text, label="Text"):
     """दिए गए text से MCQ बनाकर quiz तैयार करता है (Groq, fail होने पर DeepSeek)।"""
 
     text = (text or "").strip()
@@ -7614,7 +7677,7 @@ async def _run_text_quiz(update, context, text):
         )
         return
 
-    title = "Text: " + " ".join(text.split())[:40]
+    title = f"{label}: " + " ".join(text.split())[:40]
 
     quiz_id = create_quiz_from_question_ids(
         user_id=update.effective_user.id,
@@ -7680,6 +7743,163 @@ async def textquiz_command(update, context):
         "बहुत लंबा text हो तो .txt file भेजें।\n"
         "Cancel करने के लिए /cancel भेजें।"
     )
+
+
+# ============================================================
+# PHOTOQUIZ (फ़ोटो से MCQ)
+# ============================================================
+
+PHOTO_GROUPS = {}
+PHOTO_TASKS = set()
+
+
+async def _photo_quiz_process(update, context, file_ids):
+    """Telegram फ़ोटो/image file से text पढ़कर quiz बनाता है।"""
+
+    message = update.message
+
+    if not message:
+        return
+
+    if groq_client is None:
+        await message.reply_text(
+            "फ़ोटो से text पढ़ने के लिए GROQ_API_KEY चाहिए "
+            "(DeepSeek image नहीं पढ़ता)।"
+        )
+        return
+
+    file_ids = list(file_ids)[:max(1, PHOTO_QUIZ_MAX_IMAGES)]
+
+    await message.reply_text(
+        f"{len(file_ids)} फ़ोटो मिली, text पढ़ा जा रहा है...\n"
+        "कृपया प्रतीक्षा करें।"
+    )
+
+    images = []
+
+    for file_id in file_ids:
+        try:
+            tg_file = await context.bot.get_file(file_id)
+            data = bytes(await tg_file.download_as_bytearray())
+            if data:
+                images.append(data)
+        except Exception:
+            logger.exception("Photo download failed")
+
+    if not images:
+        await message.reply_text("फ़ोटो download नहीं हो सकी। दोबारा भेजें।")
+        return
+
+    try:
+        text = await asyncio.to_thread(_ocr_images_with_groq, images)
+    except Exception as e:
+        logger.exception("Photo OCR failed")
+        await message.reply_text(
+            "फ़ोटो से text पढ़ने में error आया।\n\n"
+            f"Error: {str(e)[:400]}\n\n"
+            "GROQ_VISION_MODEL का नाम सही है या नहीं जाँचें।"
+        )
+        return
+
+    if len((text or "").strip()) < TEXTQUIZ_MIN_CHARS:
+        await message.reply_text(
+            "फ़ोटो से पर्याप्त text नहीं पढ़ा जा सका।\n"
+            "साफ़, सीधी और अच्छी रोशनी वाली फ़ोटो भेजें।"
+        )
+        return
+
+    await _run_text_quiz(update, context, text, label="Photo")
+
+
+async def _flush_photo_group(key, update, context):
+    """Album की सारी फ़ोटो आने का थोड़ी देर इंतज़ार करके एक साथ process करता है।"""
+
+    await asyncio.sleep(PHOTO_GROUP_WAIT_SECONDS)
+
+    file_ids = PHOTO_GROUPS.pop(key, None)
+
+    if not file_ids:
+        return
+
+    try:
+        await _photo_quiz_process(update, context, file_ids)
+    except Exception:
+        logger.exception("Photo group processing failed")
+
+
+async def photo_handler(update, context):
+    """Admin की भेजी फ़ोटो से quiz (private chat में सीधे, group में /photoquiz caption के साथ)."""
+
+    message = update.message
+
+    if not message or not message.photo:
+        return
+
+    user = update.effective_user
+
+    if not user or not is_admin(user.id):
+        return
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else user.id
+    file_id = message.photo[-1].file_id
+    group_id = message.media_group_id
+
+    # Album की बाकी फ़ोटो पहले से बने group में जुड़ जाएँगी
+    if group_id and (chat_id, group_id) in PHOTO_GROUPS:
+        PHOTO_GROUPS[(chat_id, group_id)].append(file_id)
+        return
+
+    is_private = bool(chat and chat.type == "private")
+    caption = (message.caption or "").strip().lower()
+
+    if not is_private and not caption.startswith("/photoquiz"):
+        return
+
+    if group_id:
+        key = (chat_id, group_id)
+        PHOTO_GROUPS[key] = [file_id]
+        task = asyncio.create_task(_flush_photo_group(key, update, context))
+        PHOTO_TASKS.add(task)
+        task.add_done_callback(PHOTO_TASKS.discard)
+        return
+
+    await _photo_quiz_process(update, context, [file_id])
+
+
+async def photoquiz_command(update, context):
+    """किसी फ़ोटो पर reply करके /photoquiz भेजें।"""
+
+    if not await require_admin(update):
+        return
+
+    message = update.message
+
+    if not message:
+        return
+
+    replied = message.reply_to_message
+    file_ids = []
+
+    if replied and replied.photo:
+        file_ids = [replied.photo[-1].file_id]
+    elif (
+        replied
+        and replied.document
+        and (replied.document.mime_type or "").startswith("image/")
+    ):
+        file_ids = [replied.document.file_id]
+
+    if not file_ids:
+        await message.reply_text(
+            "फ़ोटो से quiz बनाने के लिए:\n\n"
+            "1) Private chat में सीधे फ़ोटो भेजें, या\n"
+            "2) किसी फ़ोटो पर reply करके /photoquiz भेजें।\n\n"
+            "कई फ़ोटो एक साथ (album) भी भेज सकते हैं।"
+        )
+        return
+
+    await _photo_quiz_process(update, context, file_ids)
 
 
 # ============================================================
@@ -9190,6 +9410,14 @@ async def document_import_handler(
     pending = PENDING.get(
         user.id
     )
+
+    # फ़ोटो (jpg/png/webp) "file" के रूप में भेजी गई हो
+    if not pending and (
+        extension in (".jpg", ".jpeg", ".png", ".webp")
+        or (document.mime_type or "").startswith("image/")
+    ):
+        await _photo_quiz_process(update, context, [document.file_id])
+        return
 
     # --------------------------------------------------------
     # अगर कोई import operation pending नहीं है
@@ -11253,6 +11481,20 @@ def build_application():
         CommandHandler(
             "textquiz",
             textquiz_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "photoquiz",
+            photoquiz_command
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
         )
     )
 
