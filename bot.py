@@ -4479,18 +4479,22 @@ def get_quiz_questions(
         if exam:
 
             conditions.append(
-                "LOWER(TRIM(COALESCE(q.exam, ''))) = LOWER(TRIM(?))"
+                "LOWER(COALESCE(q.exam, '')) LIKE ?"
             )
 
-            params.append(exam)
+            params.append(
+                "%" + str(exam).strip().lower() + "%"
+            )
 
         if subject:
 
             conditions.append(
-                "LOWER(TRIM(COALESCE(q.subject, ''))) = LOWER(TRIM(?))"
+                "LOWER(COALESCE(q.subject, '')) LIKE ?"
             )
 
-            params.append(subject)
+            params.append(
+                "%" + str(subject).strip().lower() + "%"
+            )
 
         if quiz_id:
 
@@ -4529,6 +4533,72 @@ def get_quiz_questions(
     finally:
 
         conn.close()
+
+
+def list_exam_names(user_id):
+    """हर exam नाम के कुल और unseen questions की गिनती देता है।"""
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                TRIM(COALESCE(q.exam, '')) AS exam_name,
+                COUNT(*) AS total,
+                SUM(
+                    CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM quiz_history h
+                        WHERE h.user_id = ?
+                        AND h.question_id = q.id
+                    ) THEN 1 ELSE 0 END
+                ) AS unseen
+            FROM questions q
+            WHERE q.active = 1
+            GROUP BY LOWER(TRIM(COALESCE(q.exam, '')))
+            ORDER BY total DESC
+            """,
+            (int(user_id),)
+        ).fetchall()
+
+        return [
+            (r["exam_name"], r["total"], r["unseen"] or 0)
+            for r in rows
+        ]
+
+    finally:
+        conn.close()
+
+
+def _exam_list_text(user_id, limit=20):
+    """/exam और /exams के लिए exam नामों की सूची का text."""
+
+    names = list_exam_names(user_id)
+
+    if not names:
+        return "अभी database में कोई question नहीं है।"
+
+    lines = []
+    blank = None
+
+    for name, total, unseen in names:
+        if not name:
+            blank = (total, unseen)
+            continue
+        lines.append(f"• {name}  (unseen {unseen}/{total})")
+
+    text = "उपलब्ध exam नाम:\n\n" + "\n".join(lines[:limit])
+
+    if not lines:
+        text = "किसी question पर exam का नाम सेट नहीं है।"
+
+    if blank:
+        text += (
+            f"\n\nबिना exam नाम वाले questions: {blank[0]} "
+            f"(unseen {blank[1]}) - इन्हें /quiz से खेलें।"
+        )
+
+    return text
 
 
 # ============================================================
@@ -6472,10 +6542,37 @@ async def exam_command(
     )
 
     if not questions:
-        await update.message.reply_text(
-            f"'{exam_name}' exam के लिए कोई "
-            f"unseen questions उपलब्ध नहीं हैं।"
+        # exam नाम न मिले तो subject के नाम से भी खोजें
+        questions = get_quiz_questions(
+            user_id=user.id,
+            count=count,
+            subject=exam_name
         )
+
+    if not questions:
+
+        names = list_exam_names(user.id)
+        wanted = exam_name.strip().lower()
+
+        matched = [
+            (n, t, u) for (n, t, u) in names
+            if n and wanted in n.lower()
+        ]
+
+        if matched:
+            total = sum(t for _, t, _ in matched)
+            await update.message.reply_text(
+                f"'{exam_name}' के सभी {total} questions आप कर चुके हैं।\n\n"
+                "दोबारा हल करने के लिए /resethistory भेजें, "
+                "या नए questions जोड़ें।"
+            )
+        else:
+            await update.message.reply_text(
+                f"'{exam_name}' नाम का कोई exam नहीं मिला।\n\n"
+                + _exam_list_text(user.id)
+                + "\n\nइनमें से कोई नाम /exam के साथ लिखें।"
+            )
+
         return
 
     session_id = create_quiz_session(
@@ -6492,6 +6589,17 @@ async def exam_command(
         context,
         update.effective_chat.id,
         session_id
+    )
+
+
+async def exams_command(update, context):
+    """Database में उपलब्ध exam नामों की सूची."""
+
+    user = update.effective_user
+    ensure_user(user)
+
+    await update.message.reply_text(
+        _exam_list_text(user.id)
     )
 
 
@@ -6567,6 +6675,12 @@ Question delete करें
 
 /generate 10 Topic
 AI से questions बनाएं
+
+/exams
+Database में उपलब्ध exam नाम देखें (/exam के लिए)
+
+/syllabustest EXAM [COUNT]
+Saved sources + syllabus के अनुसार पूरा test बनाएं (जैसे /syllabustest RAS 100)
 
 /textquiz TEXT
 आपके भेजे text से AI (Groq/DeepSeek) quiz बनाए (या किसी message को reply करके /textquiz)
@@ -8007,6 +8121,296 @@ async def photoquiz_command(update, context):
         return
 
     await _photo_quiz_process(update, context, file_ids)
+
+
+# ============================================================
+# SYLLABUS TEST (/syllabustest EXAM [COUNT])
+# ============================================================
+# Saved sources + web search से syllabus के हिसाब से पूरा mock test बनाता है.
+# नीचे का syllabus सिर्फ़ शुरुआती अंदाज़ा है; अपने असली syllabus के हिसाब से बदलें,
+# या environment variable SYLLABUS_JSON में यह format दें:
+# {"RAS": [["Subject", "search query", weight], ...], "CET": [...]}
+
+DEFAULT_SYLLABI = {
+    "RAS": [
+        ["राजस्थान का इतिहास", "Rajasthan history RAS prelims", 14],
+        ["राजस्थान की कला एवं संस्कृति", "Rajasthan art culture fairs festivals folk RAS", 12],
+        ["राजस्थान का भूगोल", "Rajasthan geography rivers districts RAS", 14],
+        ["भारत का इतिहास", "Indian history modern medieval ancient RAS prelims", 10],
+        ["भारत का भूगोल", "Indian geography RAS prelims", 8],
+        ["भारतीय राजव्यवस्था एवं संविधान", "Indian polity constitution RAS prelims", 12],
+        ["राजस्थान की राजव्यवस्था", "Rajasthan polity administration RAS", 6],
+        ["अर्थशास्त्र", "Indian economy Rajasthan economy RAS prelims", 8],
+        ["विज्ञान एवं प्रौद्योगिकी", "science technology general science RAS prelims", 8],
+        ["समसामयिकी", "Rajasthan current affairs", 8],
+    ],
+}
+
+
+def _load_syllabi():
+    syllabi = {k: list(v) for k, v in DEFAULT_SYLLABI.items()}
+
+    raw = os.getenv("SYLLABUS_JSON", "").strip()
+
+    if raw:
+        try:
+            extra = json.loads(raw)
+            for name, rows in extra.items():
+                clean = []
+                for row in rows:
+                    subject, query, weight = row[0], row[1], float(row[2])
+                    clean.append([str(subject), str(query), weight])
+                if clean:
+                    syllabi[str(name).strip()] = clean
+        except Exception:
+            logger.exception("SYLLABUS_JSON parse नहीं हो सका")
+
+    return syllabi
+
+
+def _find_syllabus(exam_name):
+    wanted = exam_name.strip().lower()
+
+    for name, rows in _load_syllabi().items():
+        if name.lower() == wanted:
+            return name, rows
+
+    for name, rows in _load_syllabi().items():
+        if wanted in name.lower() or name.lower() in wanted:
+            return name, rows
+
+    return None, None
+
+
+def _source_domains():
+    """Saved (enabled) sources के domains, web search को उन तक सीमित करने के लिए."""
+    from urllib.parse import urlparse
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            "SELECT url FROM sources WHERE enabled = 1"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    domains = []
+
+    for row in rows:
+        host = urlparse(row["url"] or "").netloc.replace("www.", "").strip()
+        if host and host not in domains:
+            domains.append(host)
+
+    return domains
+
+
+def _syllabus_context(query, domains):
+    """Subject के लिए context: पहले saved sources के domains में, फिर सामान्य web में."""
+
+    if not SERPAPI_API_KEY:
+        return ""
+
+    attempts = []
+
+    if domains:
+        site_filter = " OR ".join(f"site:{d}" for d in domains[:5])
+        attempts.append(f"{query} ({site_filter})")
+
+    attempts.append(query)
+
+    for attempt in attempts:
+        try:
+            context_text, _ = build_context_from_serpapi(attempt)
+            if context_text:
+                return context_text
+        except Exception:
+            logger.exception("Syllabus context search failed: %s", attempt)
+
+    return ""
+
+
+def _allocate_counts(rows, total):
+    weights = [max(0.0, float(r[2])) for r in rows]
+    weight_sum = sum(weights) or 1.0
+
+    counts = [max(1, round(total * w / weight_sum)) for w in weights]
+
+    # कुल संख्या को target के पास रखें
+    while sum(counts) > total and max(counts) > 1:
+        counts[counts.index(max(counts))] -= 1
+
+    while sum(counts) < total:
+        counts[counts.index(min(counts))] += 1
+
+    return counts
+
+
+async def syllabustest_command(update, context):
+    """/syllabustest EXAM [COUNT]: syllabus के अनुसार sources से पूरा test."""
+
+    if not await require_admin(update):
+        return
+
+    message = update.message
+
+    if not message:
+        return
+
+    if not ai_available():
+        await message.reply_text(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
+        )
+        return
+
+    args = list(context.args or [])
+
+    if not args:
+        names = ", ".join(_load_syllabi().keys())
+        await message.reply_text(
+            "Usage:\n/syllabustest EXAM [COUNT]\n\n"
+            "Example:\n/syllabustest RAS 100\n\n"
+            f"उपलब्ध syllabus: {names}"
+        )
+        return
+
+    count = 100
+
+    if args[-1].isdigit():
+        count = int(args.pop())
+
+    exam_name_input = " ".join(args).strip()
+
+    if not exam_name_input:
+        await message.reply_text("Exam का नाम दें। Example: /syllabustest RAS 100")
+        return
+
+    exam_name, rows = _find_syllabus(exam_name_input)
+
+    if not rows:
+        names = ", ".join(_load_syllabi().keys())
+        await message.reply_text(
+            f"'{exam_name_input}' का syllabus configured नहीं है।\n\n"
+            f"उपलब्ध syllabus: {names}\n\n"
+            "नया syllabus जोड़ने के लिए environment variable SYLLABUS_JSON में देना होगा।"
+        )
+        return
+
+    count = max(len(rows), min(count, MAX_IMPORT_QUESTIONS))
+    counts = _allocate_counts(rows, count)
+    domains = await asyncio.to_thread(_source_domains)
+
+    status = await message.reply_text(
+        f"📚 {exam_name} syllabus test बन रहा है ({count} questions, {len(rows)} subjects)।\n"
+        + (f"Sources: {', '.join(domains[:5])}\n" if domains else "")
+        + ("" if SERPAPI_API_KEY else
+           "⚠️ SERPAPI_API_KEY नहीं है, इसलिए questions AI की अपनी जानकारी से बनेंगे।\n")
+        + "\nइसमें कुछ मिनट लग सकते हैं..."
+    )
+
+    new_ids = []
+    duplicate = 0
+    failed_subjects = []
+    done_lines = []
+
+    for (subject, query, _weight), n in zip(rows, counts):
+
+        try:
+            ctx = await asyncio.to_thread(_syllabus_context, query, domains)
+
+            generated = await asyncio.to_thread(
+                groq_generate_questions,
+                f"{exam_name} - {subject}",
+                n,
+                ctx,
+                "syllabus-test",
+            )
+        except Exception:
+            logger.exception("Syllabus subject failed: %s", subject)
+            failed_subjects.append(subject)
+            continue
+
+        added_here = 0
+
+        for question in generated or []:
+            try:
+                question["exam"] = exam_name
+                question["subject"] = subject
+                question_id, status_text = add_question(question)
+
+                if question_id and status_text == "added":
+                    new_ids.append(question_id)
+                    added_here += 1
+                elif question_id and status_text == "duplicate":
+                    duplicate += 1
+            except Exception:
+                logger.exception("Syllabus question save failed")
+
+        done_lines.append(f"✓ {subject}: {added_here}/{n}")
+
+        try:
+            await status.edit_text(
+                f"📚 {exam_name} test बन रहा है...\n\n"
+                + "\n".join(done_lines[-12:])
+            )
+        except Exception:
+            pass
+
+    if not new_ids:
+        await message.reply_text(
+            "कोई नया question नहीं बन सका।\n"
+            f"Duplicate: {duplicate} | Failed subjects: {len(failed_subjects)}\n"
+            "सही कारण server logs में है।"
+        )
+        return
+
+    import random as _random
+    _random.shuffle(new_ids)
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=f"{exam_name} Syllabus Test"[:100],
+        question_ids=new_ids,
+        exam=exam_name,
+    )
+
+    if not quiz_id:
+        await message.reply_text("Questions बन गए, पर Quiz create नहीं हो सका।")
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+        await message.reply_text("Quiz में questions नहीं मिले।")
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    summary = [
+        "✅ Syllabus test तैयार है।",
+        "",
+        f"Exam: {exam_name}",
+        f"Questions: {len(new_ids)}",
+        f"Duplicate छोड़े गए: {duplicate}",
+        f"Quiz ID: {quiz_id}",
+    ]
+
+    if failed_subjects:
+        summary.append("Fail हुए subjects: " + ", ".join(failed_subjects))
+
+    summary += ["", "पहला question शुरू हो रहा है..."]
+
+    await message.reply_text("\n".join(summary))
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
+    )
 
 
 # ============================================================
@@ -11588,6 +11992,20 @@ def build_application():
         CommandHandler(
             "textquiz",
             textquiz_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "exams",
+            exams_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "syllabustest",
+            syllabustest_command
         )
     )
 
