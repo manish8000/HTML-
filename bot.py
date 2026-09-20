@@ -11,6 +11,9 @@ import time
 import uuid
 import html
 import hashlib
+import shutil
+import subprocess
+import tempfile
 import logging
 import sqlite3
 import threading
@@ -94,6 +97,20 @@ GROQ_VISION_MODEL = os.getenv(
     "GROQ_VISION_MODEL",
     "qwen/qwen3.6-27b"
 )
+
+# DeepSeek fallback: agar Groq fail ho jaye to MCQ generation automatically
+# DeepSeek se hoga. DEEPSEEK_API_KEY set na ho to fallback band rehta hai.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
+DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "120"))
+
+# OCRmyPDF (Tesseract) settings: scanned PDF ke liye free, offline OCR.
+# Server par `ocrmypdf` + tesseract hin/eng install hona chahiye.
+OCRMYPDF_ENABLED = os.getenv("OCRMYPDF_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+OCRMYPDF_LANGS = os.getenv("OCRMYPDF_LANGS", "hin+eng").strip() or "hin+eng"
+OCRMYPDF_TIMEOUT = int(os.getenv("OCRMYPDF_TIMEOUT", "900"))
+OCRMYPDF_JOBS = int(os.getenv("OCRMYPDF_JOBS", "2"))
 
 # SerpAPI web-search settings, used by /autoquiz to ground AI question
 # generation in fresh web results instead of relying only on model memory.
@@ -2401,6 +2418,40 @@ if GROQ_API_KEY:
 
 
 # ============================================================
+# DEEPSEEK FALLBACK
+# ============================================================
+
+def ai_available():
+    """True agar Groq ya DeepSeek me se koi bhi configured hai."""
+    return groq_client is not None or bool(DEEPSEEK_API_KEY)
+
+
+def deepseek_chat(messages, temperature=0.4, max_tokens=12000):
+    """DeepSeek chat completion (OpenAI-compatible) requests se call karta hai."""
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError("DEEPSEEK_API_KEY configured नहीं है।")
+
+    response = requests.post(
+        f"{DEEPSEEK_BASE_URL}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": DEEPSEEK_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        },
+        timeout=DEEPSEEK_TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"].get("content") or ""
+
+
+# ============================================================
 # SERPAPI CLIENT STATE
 # ============================================================
 
@@ -2613,9 +2664,9 @@ def groq_generate_questions(
     source=""
 ):
 
-    if groq_client is None:
+    if not ai_available():
         raise RuntimeError(
-            "GROQ_API_KEY configured नहीं है।"
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
         )
 
     try:
@@ -2689,44 +2740,61 @@ Context:
 {context_text}
 """
 
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "आप MCQ generator हैं। "
+                "केवल valid JSON array दें।"
+            )
+        },
+        {
+            "role": "user",
+            "content": prompt
+        }
+    ]
+
+    content = ""
     last_error = None
-    response = None
-    for attempt in range(max(1, GROQ_MAX_RETRIES + 1)):
+
+    # पहले Groq (retries के साथ)
+    if groq_client is not None:
+        for attempt in range(max(1, GROQ_MAX_RETRIES + 1)):
+            try:
+                response = groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    temperature=0.4,
+                    max_tokens=12000,
+                )
+                content = response.choices[0].message.content or ""
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= GROQ_MAX_RETRIES:
+                    break
+                delay = GROQ_RETRY_BASE_SECONDS * (2 ** attempt)
+                logger.warning(
+                    "Groq request failed (attempt %s/%s): %s; retrying in %.1fs",
+                    attempt + 1, GROQ_MAX_RETRIES + 1, exc, delay
+                )
+                time.sleep(delay)
+
+    # Groq fail हुआ (या खाली जवाब आया) तो DeepSeek fallback
+    if (last_error is not None or not content.strip() or groq_client is None) and DEEPSEEK_API_KEY:
+        if last_error is not None:
+            logger.warning("Groq failed (%s); DeepSeek fallback use हो रहा है", last_error)
         try:
-            response = groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "आप MCQ generator हैं। "
-                            "केवल valid JSON array दें।"
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.4,
-                max_tokens=12000,
-            )
-            break
+            content = deepseek_chat(messages, temperature=0.4, max_tokens=12000)
+            last_error = None
         except Exception as exc:
-            last_error = exc
-            if attempt >= GROQ_MAX_RETRIES:
-                raise
-            delay = GROQ_RETRY_BASE_SECONDS * (2 ** attempt)
-            logger.warning(
-                "Groq request failed (attempt %s/%s): %s; retrying in %.1fs",
-                attempt + 1, GROQ_MAX_RETRIES + 1, exc, delay
-            )
-            time.sleep(delay)
+            logger.exception("DeepSeek fallback भी fail हुआ")
+            last_error = last_error or exc
+            content = ""
 
-    if response is None:
-        raise last_error or RuntimeError("Groq request failed")
-
-    content = response.choices[0].message.content or ""
+    if last_error is not None and not content.strip():
+        raise last_error
 
     parsed = extract_json(
         content
@@ -3534,6 +3602,67 @@ def extract_pdf_text(file_path):
         return ""
 
 
+def _ocr_pdf_with_ocrmypdf(file_path):
+    """Scanned PDF ko OCRmyPDF (Tesseract) se searchable bana kar text nikalta hai.
+
+    Free aur unlimited hai. Agar ocrmypdf install nahi hai ya fail ho jaye to
+    empty string lautata hai, taaki caller Groq vision par fallback kar sake.
+    """
+    if not OCRMYPDF_ENABLED:
+        return ""
+
+    if shutil.which("ocrmypdf") is None:
+        logger.warning("ocrmypdf install nahi hai; OCRmyPDF step skip ho raha hai")
+        return ""
+
+    out_path = None
+    try:
+        fd, out_path = tempfile.mkstemp(suffix=".pdf", dir=str(DATA_DIR))
+        os.close(fd)
+
+        cmd = [
+            "ocrmypdf",
+            "-l", OCRMYPDF_LANGS,
+            "--skip-text",
+            "--output-type", "pdf",
+            "--optimize", "0",
+            "--jobs", str(max(1, OCRMYPDF_JOBS)),
+            str(file_path),
+            out_path,
+        ]
+
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=OCRMYPDF_TIMEOUT,
+        )
+
+        # 0 = success, 6 = pehle se text tha (skip-text), dono chalega
+        if proc.returncode not in (0, 6):
+            logger.error(
+                "ocrmypdf fail (code %s): %s",
+                proc.returncode,
+                (proc.stderr or "")[-800:],
+            )
+            return ""
+
+        return extract_pdf_text(out_path)
+
+    except subprocess.TimeoutExpired:
+        logger.error("ocrmypdf timeout (%ss) for %s", OCRMYPDF_TIMEOUT, file_path)
+        return ""
+    except Exception:
+        logger.exception("ocrmypdf OCR failed for %s", file_path)
+        return ""
+    finally:
+        if out_path:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+
+
 def _ocr_pdf_with_groq(file_path, max_pages=None):
     """OCR image/scanned PDF pages with Groq vision when PyMuPDF is installed."""
     if groq_client is None:
@@ -3958,9 +4087,16 @@ def import_pdf(
     # Scanned/image PDFs often return little or no text through pypdf.
     # Automatically fall back to Groq vision OCR instead of rejecting the PDF.
     if len(text.strip()) < 100:
-        ocr_text = _ocr_pdf_with_groq(file_path)
-        if ocr_text.strip():
+        # 1) पहले free/offline OCRmyPDF (Tesseract)
+        ocr_text = _ocr_pdf_with_ocrmypdf(file_path)
+        if len(ocr_text.strip()) >= 100:
+            logger.info("Scanned PDF OCRmyPDF से पढ़ी गई: %s", file_name)
             text = ocr_text
+        else:
+            # 2) OCRmyPDF fail/खाली हो तो Groq vision
+            ocr_text = _ocr_pdf_with_groq(file_path)
+            if ocr_text.strip():
+                text = ocr_text
 
     if not text.strip():
         return empty_result
@@ -7415,9 +7551,9 @@ async def autoquiz_command(update, context):
         )
         return
 
-    if groq_client is None:
+    if not ai_available():
         await update.message.reply_text(
-            "GROQ_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
         )
         return
 
@@ -7708,9 +7844,9 @@ async def newsquiz_command(update, context):
         )
         return
 
-    if groq_client is None:
+    if not ai_available():
         await update.message.reply_text(
-            "GROQ_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
         )
         return
 
@@ -7919,9 +8055,9 @@ async def wikiquiz_command(update, context):
     if not await require_admin(update):
         return
 
-    if groq_client is None:
+    if not ai_available():
         await update.message.reply_text(
-            "GROQ_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है, इसलिए questions generate नहीं हो सकते।"
         )
         return
 
@@ -8933,9 +9069,14 @@ async def document_import_handler(
 
                 new_ids = result.get("ids", []) if isinstance(result, dict) else []
                 if not new_ids:
+                    r = result if isinstance(result, dict) else {}
                     await update.message.reply_text(
-                        "File पढ़ ली गई, लेकिन कोई valid नया MCQ नहीं बन सका।\n"
-                        "Scanned PDF के लिए Koyeb requirements में PyMuPDF install होना चाहिए।"
+                        "File पढ़ ली गई, लेकिन कोई नया MCQ नहीं बन सका।\n"
+                        f"Generated: {r.get('total', 0)} | "
+                        f"Duplicate: {r.get('duplicate', 0)} | "
+                        f"Failed: {r.get('failed', 0)}\n"
+                        "सब 0 है तो OCR/text निकालने में दिक्कत है; "
+                        "सही कारण server logs में है।"
                     )
                     return
 
