@@ -5418,7 +5418,10 @@ async def quizid_command(
 
         await update.message.reply_text(
             "Usage:\n"
-            "/quizid QUIZ_ID [seconds]"
+            "/quizid QUIZ_ID [seconds] [retry]\n\n"
+            "Example:\n"
+            "/quizid 12\n"
+            "/quizid 12 retry  (पहले हल किया quiz दोबारा)"
         )
 
         return
@@ -5438,15 +5441,22 @@ async def quizid_command(
         return
 
     time_limit = None
+    retry = False
 
-    if len(context.args) > 1:
+    for extra in context.args[1:]:
+
+        word = extra.strip().lower()
+
+        if word in ("retry", "again", "redo", "repeat", "r"):
+            retry = True
+            continue
 
         try:
             time_limit = clamp_quiz_time(
-                int(context.args[1])
+                int(word)
             )
         except Exception:
-            time_limit = None
+            pass
 
     quiz = get_quiz(
         quiz_id
@@ -5460,18 +5470,28 @@ async def quizid_command(
 
         return
 
-    questions = get_unseen_saved_quiz_questions(
-        user_id=user.id,
-        quiz_id=quiz_id,
-        count=10_000_000
-    )
+    if retry:
+        # पहले किए हुए questions समेत पूरा quiz दोबारा
+        questions = get_saved_quiz_questions(quiz_id)
+    else:
+        questions = get_unseen_saved_quiz_questions(
+            user_id=user.id,
+            quiz_id=quiz_id,
+            count=10_000_000
+        )
 
     if not questions:
 
-        await update.message.reply_text(
-            "इस quiz के सभी questions "
-            "आप पहले ही कर चुके हैं।"
-        )
+        if retry:
+            await update.message.reply_text(
+                "इस quiz में कोई active question नहीं मिला।"
+            )
+        else:
+            await update.message.reply_text(
+                "इस quiz के सभी questions आप पहले ही कर चुके हैं।\n\n"
+                "दोबारा हल करने के लिए:\n"
+                f"/quizid {quiz_id} retry"
+            )
 
         return
 
@@ -6359,7 +6379,7 @@ Saved (🔖) questions देखें
 अपना referral link पाएं
 
 /quizid ID
-Saved quiz शुरू करें
+Saved quiz शुरू करें (पहले हल किया हो तो /quizid ID retry)
 
 /newquiz
 नया quiz बनाएं
