@@ -5282,12 +5282,16 @@ async def quiz_timeout_watcher(
 
     chat_id = poll_info["chat_id"]
 
+    notice_message_id = None
+
     try:
 
-        await context.bot.send_message(
+        notice = await context.bot.send_message(
             chat_id=chat_id,
             text="⏰ समय समाप्त हो गया। अगला प्रश्न..."
         )
+
+        notice_message_id = notice.message_id
 
     except Exception:
         logger.exception(
@@ -5306,6 +5310,19 @@ async def quiz_timeout_watcher(
         session_id,
         chat_id
     )
+
+    # नया प्रश्न आ जाने के बाद "समय समाप्त" notice अपने आप delete
+    if notice_message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=notice_message_id
+            )
+        except Exception:
+            logger.debug(
+                "Timeout notice delete failed",
+                exc_info=True
+            )
 
 
 # ============================================================
