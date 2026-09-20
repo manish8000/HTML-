@@ -6381,6 +6381,9 @@ Question delete करें
 /generate 10 Topic
 AI से questions बनाएं
 
+/textquiz TEXT
+आपके भेजे text से AI (Groq/DeepSeek) quiz बनाए (या किसी message को reply करके /textquiz)
+
 /autoquiz [COUNT] TOPIC
 SerpAPI web-search + AI से quiz अपने आप बनाकर शुरू करें
 
@@ -6686,6 +6689,10 @@ async def pending_text_handler(
         )
         return
 
+    if pending.get("action") == "textquiz":
+        PENDING.pop(user_id, None)
+        await _run_text_quiz(update, context, text)
+        return
 
     data = parse_question_text(
         text
@@ -7521,6 +7528,137 @@ async def generate_command(update, context):
 
     await update.message.reply_text(
         "\n".join(summary_lines)
+    )
+
+
+# ============================================================
+# TEXTQUIZ COMMAND (भेजे गए text से MCQ)
+# ============================================================
+
+TEXTQUIZ_MIN_CHARS = 40
+
+
+async def _run_text_quiz(update, context, text):
+    """दिए गए text से MCQ बनाकर quiz तैयार करता है (Groq, fail होने पर DeepSeek)।"""
+
+    text = (text or "").strip()
+
+    if len(text) < TEXTQUIZ_MIN_CHARS:
+        await update.message.reply_text(
+            "Text बहुत छोटा है। कम से कम कुछ पूरे वाक्य भेजें।"
+        )
+        return
+
+    if not ai_available():
+        await update.message.reply_text(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
+        )
+        return
+
+    # छोटे text पर कम प्रश्न, लंबे text (12000+ chars) पर automatic chunk mode
+    if len(text) <= AUTO_IMPORT_CHUNK_CHARS:
+        # facts वाली सूची जैसे dense text पर ज़्यादा प्रश्न: लगभग हर 60 अक्षर पर 1
+        count = max(5, min(20, len(text) // 60))
+    else:
+        count = None
+
+    await update.message.reply_text(
+        "Text मिल गया, AI questions बना रहा है...\n"
+        "कृपया प्रतीक्षा करें।"
+    )
+
+    try:
+        result = await asyncio.to_thread(
+            import_questions_from_text,
+            text,
+            "text-quiz",
+            count,
+        )
+    except Exception as e:
+        logger.exception("Text quiz generation failed")
+        await update.message.reply_text(
+            "Question generation में error आया।\n\n"
+            f"Error: {str(e)[:500]}"
+        )
+        return
+
+    new_ids = result.get("ids", []) if isinstance(result, dict) else []
+
+    if not new_ids:
+        r = result if isinstance(result, dict) else {}
+        await update.message.reply_text(
+            "कोई नया MCQ नहीं बन सका।\n"
+            f"Generated: {r.get('total', 0)} | "
+            f"Duplicate: {r.get('duplicate', 0)} | "
+            f"Failed: {r.get('failed', 0)}"
+        )
+        return
+
+    title = "Text: " + " ".join(text.split())[:40]
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=title,
+        question_ids=new_ids,
+    )
+
+    lines = [
+        "Quiz तैयार है!",
+        "",
+        f"Questions: {len(new_ids)}",
+        f"Duplicate: {result.get('duplicate', 0)}",
+    ]
+
+    if quiz_id:
+        lines += [
+            "",
+            f"Quiz ID: {quiz_id}",
+            "Start करने के लिए:",
+            f"/quizid {quiz_id}",
+        ]
+    else:
+        lines += ["", "Questions बन गए, पर Quiz create नहीं हो सका।"]
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def textquiz_command(update, context):
+
+    if not await require_admin(update):
+        return
+
+    message = update.message
+
+    if not message:
+        return
+
+    # 1) /textquiz <text> (कई lines भी चलेंगी)
+    raw = message.text or ""
+    parts = raw.split(None, 1)
+    inline_text = parts[1].strip() if len(parts) > 1 else ""
+
+    # 2) किसी message को reply करके /textquiz
+    replied = ""
+    if message.reply_to_message:
+        replied = (
+            message.reply_to_message.text
+            or message.reply_to_message.caption
+            or ""
+        ).strip()
+
+    source_text = inline_text or replied
+
+    if source_text:
+        await _run_text_quiz(update, context, source_text)
+        return
+
+    # 3) सिर्फ़ /textquiz: अगला text message source बनेगा
+    PENDING[update.effective_user.id] = {"action": "textquiz"}
+
+    await message.reply_text(
+        "अब वह text भेजें जिससे quiz बनाना है।\n\n"
+        "बहुत लंबा text हो तो .txt file भेजें।\n"
+        "Cancel करने के लिए /cancel भेजें।"
     )
 
 
@@ -11088,6 +11226,13 @@ def build_application():
         CommandHandler(
             "generate",
             generate_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "textquiz",
+            textquiz_command
         )
     )
 
