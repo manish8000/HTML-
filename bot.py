@@ -33,6 +33,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -113,6 +114,15 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip() or "deepseek-v4-flash"
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip().rstrip("/")
 DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "120"))
+
+# Branding: हर question/scorecard पर channel का username और bot का नाम (bold).
+# BRAND_NAME (bold में दिखता है) और BRAND_USERNAME (channel) environment variable से बदले जा सकते हैं.
+BRAND_ENABLED = os.getenv("BRAND_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+BRAND_NAME = os.getenv("BRAND_NAME", "@Meraraja_bot").strip()
+BRAND_USERNAME = os.getenv("BRAND_USERNAME", "@dailyquiz_manish").strip()
+# 1 (default): हर question पहले एक अलग message में bold नाम के साथ आता है (poll के ऊपर).
+# 0 करने पर bold नाम सिर्फ़ explanation और scorecard में दिखेगा.
+BRAND_QUESTION_MESSAGE = os.getenv("BRAND_QUESTION_MESSAGE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Keep-alive: Koyeb free instance 1 घंटे बिना traffic के sleep हो जाता है.
 # KEEPALIVE_URL = service का public URL (जैसे https://myapp-xxx.koyeb.app).
@@ -5218,6 +5228,50 @@ def get_current_question(
 ANSWER_LETTERS = ["A", "B", "C", "D"]
 
 
+def get_brand(context):
+    """(नाम, @username) लौटाता है; branding बंद हो तो दोनों खाली."""
+
+    if not BRAND_ENABLED:
+        return "", ""
+
+    name = BRAND_NAME
+    username = BRAND_USERNAME
+
+    if not name:
+        try:
+            name = context.bot.first_name or ""
+        except Exception:
+            name = ""
+
+    if not username:
+        try:
+            if context.bot.username:
+                username = "@" + context.bot.username
+        except Exception:
+            username = ""
+
+    username = username.strip()
+
+    if username and not username.startswith("@"):
+        username = "@" + username
+
+    return name.strip()[:60], username[:40]
+
+
+def brand_html(name, username):
+    """Bold नाम + username का HTML (खाली हो तो खाली string)."""
+
+    parts = []
+
+    if name:
+        parts.append(f"<b>{html.escape(name)}</b>")
+
+    if username:
+        parts.append(html.escape(username))
+
+    return " ".join(parts)
+
+
 async def send_quiz_question(
     context,
     chat_id,
@@ -5277,37 +5331,76 @@ async def send_quiz_question(
         or ""
     ).strip()
 
-    # Telegram poll explanation limit ~200 characters
-    poll_explanation = (
-        explanation[:195] + "..."
-        if len(explanation) > 195
-        else explanation
+    brand_name, brand_user = get_brand(context)
+    brand_line = brand_html(brand_name, brand_user)
+
+    # Telegram poll explanation limit 200 अक्षर (formatting के बाद).
+    # Bold नाम + username हमेशा जुड़ते हैं, बाकी जगह में explanation आती है।
+    brand_plain_len = (
+        len(brand_name)
+        + (1 if brand_name and brand_user else 0)
+        + len(brand_user)
     )
+
+    if brand_line:
+        body_limit = max(0, 200 - brand_plain_len - 2)
+    else:
+        body_limit = 198
+
+    expl_body = explanation
+
+    if len(expl_body) > body_limit:
+        expl_body = (
+            expl_body[:max(0, body_limit - 3)] + "..."
+            if body_limit > 3 else ""
+        )
+
+    poll_explanation = html.escape(expl_body)
+
+    if brand_line:
+        if poll_explanation:
+            poll_explanation += "\n\n"
+        poll_explanation += brand_line
 
     time_limit = clamp_quiz_time(
         session.get("time_limit")
         or get_quiz_time()
     )
 
-    full_question = (
-        f"प्रश्न {index}/{total}\n\n"
-        f"{question['question']}"
-    )
+    header = f"प्रश्न {index}/{total}"
 
-    if len(full_question) > 290:
-        # Poll में प्रश्न 300 अक्षर तक ही आता है; लंबा प्रश्न (कथन/कारण/कालक्रम)
-        # पहले अलग message में पूरा भेजें
+    if brand_user:
+        header += f" | {brand_user}"
+
+    full_question = f"{header}\n\n{question['question']}"
+
+    if len(full_question) > 290 or BRAND_QUESTION_MESSAGE:
+        # Poll में प्रश्न 300 अक्षर तक ही आता है (और bold नहीं हो सकता); इसलिए
+        # लंबा प्रश्न (कथन/कारण/कालक्रम) या branding-message चालू हो तो प्रश्न
+        # पहले अलग message में bold नाम के साथ भेजें
+        text_html = (
+            (brand_line + "\n\n" if brand_line else "")
+            + f"<b>प्रश्न {index}/{total}</b>\n\n"
+            + html.escape(str(question["question"])[:3400])
+        )
+
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=full_question[:4000]
+                text=text_html,
+                parse_mode=ParseMode.HTML
             )
         except Exception:
-            logger.exception("Long question message failed")
+            logger.exception("Question message (HTML) failed")
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=full_question[:4000]
+                )
+            except Exception:
+                logger.exception("Question message failed")
 
-        question_text = (
-            f"प्रश्न {index}/{total}: ऊपर दिए गए प्रश्न का सही उत्तर चुनें"
-        )
+        question_text = f"{header}: ऊपर दिए गए प्रश्न का सही उत्तर चुनें"
     else:
         question_text = full_question
 
@@ -5319,6 +5412,9 @@ async def send_quiz_question(
         correct_option_id=correct_option_id,
         is_anonymous=False,
         explanation=poll_explanation or None,
+        explanation_parse_mode=(
+            ParseMode.HTML if poll_explanation else None
+        ),
         open_period=time_limit,
         reply_markup=InlineKeyboardMarkup(
             [
@@ -5570,6 +5666,19 @@ async def send_scorecard(
                 f"• {b}" for b in new_badges
             )
         )
+
+    brand_line = brand_html(*get_brand(context))
+
+    if brand_line:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=html.escape(text) + "\n\n" + brand_line,
+                parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception:
+            logger.exception("Scorecard (HTML) failed")
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -6702,6 +6811,9 @@ AI से questions बनाएं
 
 /exams
 Database में उपलब्ध exam नाम देखें (/exam के लिए)
+
+/topicquiz SUBJECT [COUNT] [STYLE] [TOPIC]
+किसी भी subject (maths, english, gk, current, hindi, reasoning...) या mix का quiz, sources + कथन-कारण के साथ
 
 /rpsc [TYPE] [COUNT] TOPIC
 RPSC पैटर्न प्रश्न: कथन, कथन-कारण, कालक्रम, सुमेलन (जैसे /rpsc karan 10 राजस्थान इतिहास)
@@ -8690,6 +8802,518 @@ async def rpsc_command(update, context):
 
     if failed_types:
         summary.append("Fail हुए प्रकार: " + ", ".join(failed_types))
+
+    summary += ["", "पहला question शुरू हो रहा है..."]
+
+    await message.reply_text("\n".join(summary))
+
+    await send_quiz_question(
+        context,
+        update.effective_chat.id,
+        session_id,
+    )
+
+
+# ============================================================
+# TOPIC / SUBJECT QUIZ (/topicquiz)
+# ============================================================
+# किसी भी subject (maths, english, gk, current affairs, hindi, reasoning ...)
+# या mix का quiz, saved sources के context और कथन-कारण जैसे patterns के साथ.
+
+TQ_STYLE_TEXT = dict(RPSC_STYLES)
+
+TQ_STYLE_TEXT["nishkarsh"] = (
+    "शैली: कथन-निष्कर्ष (तर्कशक्ति)।\n"
+    "- question में \"कथन: ...\" (1-2 वाक्य) फिर \"निष्कर्ष I: ...\" और \"निष्कर्ष II: ...\" "
+    "अलग पंक्तियों में, अंत में \"कौन-सा निष्कर्ष कथन से तार्किक रूप से अनुसरण करता है?\"\n"
+    "- options ठीक ये चार हों:\n"
+    "  option_a: केवल निष्कर्ष I अनुसरण करता है\n"
+    "  option_b: केवल निष्कर्ष II अनुसरण करता है\n"
+    "  option_c: या तो I या II अनुसरण करता है\n"
+    "  option_d: न तो I और न ही II अनुसरण करता है\n"
+    "- चारों तरह के उत्तर मिला-जुलाकर रखें।"
+)
+
+TQ_SUBJECTS = {
+    "gk": {
+        "label": "सामान्य ज्ञान", "exam": "GK", "sources": True, "news": False,
+        "query": "general knowledge India Rajasthan",
+        "hint": "भारत और राजस्थान के सामान्य ज्ञान पर तथ्य आधारित प्रश्न।",
+        "plan": [("simple", 5), ("kathan", 2), ("karan", 1), ("kitne", 1), ("kalkram", 1)],
+    },
+    "current": {
+        "label": "करंट अफेयर्स", "exam": "Current Affairs", "sources": True, "news": True,
+        "query": "current affairs Rajasthan India latest",
+        "hint": "हाल की घटनाओं पर प्रश्न; घटना का समय/स्थान स्पष्ट हो; context में न मिले तो अनिश्चित तथ्य न लिखें।",
+        "plan": [("simple", 4), ("kathan", 2), ("karan", 1), ("kitne", 1), ("kalkram", 1)],
+    },
+    "history": {
+        "label": "इतिहास", "exam": "History", "sources": True, "news": False,
+        "query": "Indian history Rajasthan history",
+        "hint": "भारत और राजस्थान के इतिहास पर प्रश्न (प्राचीन, मध्यकालीन, आधुनिक)।",
+        "plan": [("simple", 4), ("kathan", 2), ("karan", 1), ("kalkram", 2), ("kitne", 1)],
+    },
+    "geography": {
+        "label": "भूगोल", "exam": "Geography", "sources": True, "news": False,
+        "query": "Indian geography Rajasthan geography",
+        "hint": "भारत और राजस्थान के भूगोल पर प्रश्न (नदियाँ, जलवायु, मिट्टी, खनिज, जिले)।",
+        "plan": [("simple", 5), ("kathan", 2), ("karan", 1), ("sumel", 1), ("kitne", 1)],
+    },
+    "polity": {
+        "label": "राजव्यवस्था", "exam": "Polity", "sources": True, "news": False,
+        "query": "Indian polity constitution Rajasthan administration",
+        "hint": "भारतीय संविधान, संस्थाओं और राजस्थान की राजव्यवस्था पर प्रश्न।",
+        "plan": [("simple", 4), ("kathan", 3), ("karan", 2), ("kitne", 1), ("kalkram", 1)],
+    },
+    "economy": {
+        "label": "अर्थशास्त्र", "exam": "Economy", "sources": True, "news": False,
+        "query": "Indian economy Rajasthan economy",
+        "hint": "भारतीय और राजस्थान की अर्थव्यवस्था, बजट, योजनाओं पर प्रश्न।",
+        "plan": [("simple", 5), ("kathan", 2), ("karan", 1), ("kitne", 1)],
+    },
+    "science": {
+        "label": "विज्ञान", "exam": "Science", "sources": True, "news": False,
+        "query": "general science technology",
+        "hint": "भौतिकी, रसायन, जीव विज्ञान और प्रौद्योगिकी के प्रश्न।",
+        "plan": [("simple", 5), ("kathan", 2), ("karan", 2), ("kitne", 1)],
+    },
+    "rajasthan": {
+        "label": "राजस्थान GK", "exam": "Rajasthan GK", "sources": True, "news": False,
+        "query": "Rajasthan general knowledge",
+        "hint": "राजस्थान का इतिहास, कला-संस्कृति, भूगोल, मेले-त्योहार, योजनाएँ।",
+        "plan": [("simple", 4), ("kathan", 2), ("karan", 1), ("sumel", 1), ("kalkram", 1), ("kitne", 1)],
+    },
+    "maths": {
+        "label": "गणित", "exam": "Maths", "sources": False, "news": False,
+        "query": "",
+        "hint": (
+            "गणित के प्रश्न (प्रतिशत, लाभ-हानि, औसत, समय-कार्य, गति-दूरी, अनुपात, "
+            "ब्याज, क्षेत्रमिति, बीजगणित, संख्या पद्धति)। हर प्रश्न में गणना ज़रूरी हो, "
+            "options संख्यात्मक हों, explanation में हल के चरण संक्षेप में दें, "
+            "और उत्तर को खुद दोबारा जाँचकर ही लिखें।"
+        ),
+        "plan": [("simple", 1)],
+    },
+    "reasoning": {
+        "label": "तर्कशक्ति (Reasoning)", "exam": "Reasoning", "sources": False, "news": False,
+        "query": "",
+        "hint": (
+            "तार्किक प्रश्न: श्रेणी, सादृश्य, कोडिंग-डिकोडिंग, रक्त संबंध, दिशा, "
+            "न्यायवाक्य, वेन आरेख, क्रम-व्यवस्था। हर प्रश्न स्वयं में पूर्ण और हल योग्य हो।"
+        ),
+        "plan": [("simple", 5), ("nishkarsh", 3)],
+    },
+    "english": {
+        "label": "English", "exam": "English", "sources": False, "news": False,
+        "query": "",
+        "hint": (
+            "English language questions: grammar, vocabulary, synonyms/antonyms, idioms, "
+            "error spotting, fill in the blanks, one-word substitution, sentence improvement। "
+            "प्रश्न और options अंग्रेज़ी में हों (explanation हिंदी में)।"
+        ),
+        "plan": [("simple", 1)],
+    },
+    "hindi": {
+        "label": "हिंदी", "exam": "Hindi", "sources": False, "news": False,
+        "query": "",
+        "hint": (
+            "हिंदी व्याकरण और साहित्य: संधि, समास, विलोम-पर्यायवाची, मुहावरे-लोकोक्तियाँ, "
+            "शब्द/वाक्य शुद्धि, लेखक और रचनाएँ, अलंकार, छंद।"
+        ),
+        "plan": [("simple", 4), ("kathan", 1)],
+    },
+}
+
+TQ_MIX_PLAN = [
+    ["gk|simple", "", 3],
+    ["current|simple", "", 3],
+    ["maths|simple", "", 3],
+    ["reasoning|simple", "", 3],
+    ["history|kathan", "", 2],
+    ["polity|karan", "", 2],
+    ["english|simple", "", 2],
+    ["hindi|simple", "", 2],
+    ["geography|simple", "", 2],
+    ["science|simple", "", 2],
+    ["gk|kitne", "", 1],
+    ["history|kalkram", "", 1],
+]
+
+TQ_SUBJECT_ALIASES = {
+    "gk": "gk", "gs": "gk", "generalknowledge": "gk", "samanya": "gk",
+    "current": "current", "currentaffairs": "current", "ca": "current", "news": "current", "samsamayiki": "current",
+    "maths": "maths", "math": "maths", "ganit": "maths", "quant": "maths",
+    "english": "english", "eng": "english",
+    "hindi": "hindi",
+    "reasoning": "reasoning", "reason": "reasoning", "logic": "reasoning",
+    "history": "history", "itihas": "history",
+    "geography": "geography", "geo": "geography", "bhugol": "geography",
+    "polity": "polity", "constitution": "polity",
+    "economy": "economy", "eco": "economy",
+    "science": "science", "vigyan": "science",
+    "rajasthan": "rajasthan", "raj": "rajasthan", "rajgk": "rajasthan",
+    "mix": "mix", "mixed": "mix", "all": "mix",
+}
+
+TQ_STYLE_ALIASES = {k: v for k, v in RPSC_ALIASES.items() if v != "mix"}
+TQ_STYLE_ALIASES.update({
+    "simple": "simple", "normal": "simple", "mcq": "simple",
+    "nishkarsh": "nishkarsh", "conclusion": "nishkarsh",
+    "pattern": "pattern",
+})
+
+TQ_STYLE_LABELS = dict(RPSC_LABELS)
+TQ_STYLE_LABELS["simple"] = "सामान्य MCQ"
+TQ_STYLE_LABELS["nishkarsh"] = "कथन-निष्कर्ष"
+
+TQ_PATTERN_STYLES = ["kathan", "karan", "kalkram", "kitne"]
+TQ_CHUNK = 15
+
+
+def _parse_topicquiz_args(args):
+    """/topicquiz [SUBJECT] [COUNT] [STYLE...] [TOPIC] -> (subject, styles, count, topic)"""
+    args = list(args or [])
+
+    subject = None
+
+    if args and args[0].lower() in TQ_SUBJECT_ALIASES:
+        subject = TQ_SUBJECT_ALIASES[args.pop(0).lower()]
+
+    count = None
+    styles = []
+
+    while args:
+        word = args[0].lower()
+
+        if word.isdigit() and count is None:
+            count = int(word)
+            args.pop(0)
+            continue
+
+        if word in TQ_STYLE_ALIASES:
+            style = TQ_STYLE_ALIASES[word]
+            styles.extend(TQ_PATTERN_STYLES if style == "pattern" else [style])
+            args.pop(0)
+            continue
+
+        break
+
+    topic = " ".join(args).strip()
+
+    if subject is None:
+        subject = "gk"
+
+    if count is None:
+        count = 15
+
+    count = max(1, min(count, 50))
+
+    seen = []
+    for st in styles:
+        if st not in seen:
+            seen.append(st)
+
+    return subject, seen, count, topic
+
+
+def _topicquiz_jobs(subject, styles, count):
+    """[(subject_key, style_key, n)] की सूची, count के अनुसार बाँटकर."""
+
+    if subject == "mix":
+        rows = TQ_MIX_PLAN[:max(1, min(count, len(TQ_MIX_PLAN)))]
+    elif styles:
+        rows = [[f"{subject}|{st}", "", 1] for st in styles]
+        rows = rows[:max(1, min(count, len(rows)))]
+    else:
+        rows = [
+            [f"{subject}|{st}", "", w]
+            for st, w in TQ_SUBJECTS[subject]["plan"]
+        ]
+        rows = rows[:max(1, min(count, len(rows)))]
+
+    counts = _allocate_counts(rows, count)
+
+    jobs = []
+
+    for row, n in zip(rows, counts):
+        subj, style = row[0].split("|")
+        if n > 0:
+            jobs.append((subj, style, n))
+
+    return jobs
+
+
+def _topicquiz_style_text(subject, style):
+    cfg = TQ_SUBJECTS[subject]
+
+    if style == "simple":
+        text = (
+            "शैली: सामान्य MCQ (चार विकल्प, एक सही उत्तर)।\n"
+            f"- {cfg['hint']}\n"
+            "- हर option 90 अक्षरों के भीतर; सही उत्तर A, B, C, D में बदल-बदल कर रखें।\n"
+            "- explanation में सही उत्तर का कारण संक्षेप में दें।"
+        )
+    else:
+        text = TQ_STYLE_TEXT[style] + "\n" + RPSC_COMMON_RULES
+        text += f"\n- विषय-क्षेत्र: {cfg['hint']}"
+
+    if subject == "english":
+        text += "\n- प्रश्न और options अंग्रेज़ी भाषा में हों (explanation हिंदी में)।"
+
+    return text
+
+
+def _collect_source_pages(max_sources=8, max_chars_each=3500):
+    """सभी enabled saved sources के pages का text (एक बार, thread में)."""
+
+    conn = db()
+
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sources WHERE enabled = 1"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    parts = []
+
+    for row in rows[:max_sources]:
+        try:
+            data = crawl_source(row["name"])
+            text = (data.get("text") or "").strip()
+            if text:
+                parts.append(
+                    f"Source {row['name']} ({data.get('url')}):\n{text[:max_chars_each]}"
+                )
+        except Exception:
+            logger.exception("Source crawl failed: %s", row["name"])
+
+    return "\n\n".join(parts), len(rows)
+
+
+def _topicquiz_context(cfg, topic, domains, source_pages):
+    """किसी subject के लिए context: news search + sources के domains + sources के pages."""
+
+    if not cfg.get("sources"):
+        return ""
+
+    query = f"{topic} {cfg['query']}".strip() if topic else cfg["query"]
+    parts = []
+
+    if cfg.get("news") and SERPAPI_API_KEY:
+        try:
+            news_text, _ = build_context_from_serpapi(
+                f"{topic or 'Rajasthan India'} latest news",
+                engine="google_news",
+            )
+            if news_text:
+                parts.append(news_text)
+        except Exception:
+            logger.exception("News context failed")
+
+    web_text = _syllabus_context(query, domains)
+
+    if web_text:
+        parts.append(web_text)
+
+    if source_pages:
+        parts.append(source_pages)
+
+    return "\n\n".join(parts)[:30000]
+
+
+async def topicquiz_command(update, context):
+    """/topicquiz [SUBJECT] [COUNT] [STYLE] [TOPIC]"""
+
+    if not await require_admin(update):
+        return
+
+    message = update.message
+
+    if not message:
+        return
+
+    if not ai_available():
+        await message.reply_text(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
+        )
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "Subject/topic के अनुसार quiz बनाएं:\n\n"
+            "/topicquiz SUBJECT [COUNT] [STYLE] [TOPIC]\n\n"
+            "SUBJECT: gk, current, maths, english, hindi, reasoning, "
+            "history, geography, polity, economy, science, rajasthan, mix\n\n"
+            "STYLE (वैकल्पिक): simple, kathan, karan, kalkram, sumel, kitne, "
+            "nishkarsh, pattern\n"
+            "STYLE न देने पर हर subject में सामान्य प्रश्नों के साथ "
+            "कथन-कारण जैसे प्रश्न भी अपने आप जुड़ते हैं।\n\n"
+            "Examples:\n"
+            "/topicquiz maths 20 प्रतिशत\n"
+            "/topicquiz current 15\n"
+            "/topicquiz gk 20 karan राजस्थान\n"
+            "/topicquiz history 10 kalkram\n"
+            "/topicquiz mix 30"
+        )
+        return
+
+    subject, styles, count, topic = _parse_topicquiz_args(context.args)
+
+    cfg = TQ_SUBJECTS.get(subject)
+    subject_label = "मिश्रित (सभी subjects)" if subject == "mix" else cfg["label"]
+
+    jobs = _topicquiz_jobs(subject, styles, count)
+
+    status = await message.reply_text(
+        f"📝 {subject_label} quiz बन रहा है\n"
+        + (f"Topic: {topic}\n" if topic else "")
+        + f"Questions: {count}\n\n"
+        "Saved sources से context जुटाया जा रहा है..."
+    )
+
+    domains = await asyncio.to_thread(_source_domains)
+
+    needs_sources = subject == "mix" or (cfg and cfg.get("sources"))
+    source_pages, source_count = ("", 0)
+
+    if needs_sources:
+        source_pages, source_count = await asyncio.to_thread(
+            _collect_source_pages
+        )
+
+    note = []
+    note.append(f"Sources: {source_count}")
+    note.append("Web search: चालू" if SERPAPI_API_KEY else "Web search: बंद (SERPAPI_API_KEY नहीं)")
+
+    try:
+        await status.edit_text(
+            f"📝 {subject_label} quiz बन रहा है\n"
+            + " | ".join(note)
+            + "\n\nAI प्रश्न बना रहा है..."
+        )
+    except Exception:
+        pass
+
+    context_cache = {}
+    new_ids = []
+    duplicate = 0
+    failed = []
+    lines = []
+
+    for subj, style, n in jobs:
+
+        subj_cfg = TQ_SUBJECTS[subj]
+        step_label = f"{subj_cfg['label']} - {TQ_STYLE_LABELS[style]}"
+
+        if subj not in context_cache:
+            context_cache[subj] = await asyncio.to_thread(
+                _topicquiz_context, subj_cfg, topic, domains, source_pages
+            )
+
+        ctx_text = context_cache[subj]
+        style_text = _topicquiz_style_text(subj, style)
+        gen_topic = (
+            f"{subj_cfg['label']}"
+            + (f" - {topic}" if topic else "")
+            + f" ({TQ_STYLE_LABELS[style]} प्रश्न)"
+        )
+
+        added_here = 0
+        remaining = n
+
+        while remaining > 0:
+
+            k = min(TQ_CHUNK, remaining)
+            remaining -= k
+
+            try:
+                generated = await asyncio.to_thread(
+                    groq_generate_questions,
+                    gen_topic,
+                    k,
+                    ctx_text,
+                    f"topicquiz-{subj}-{style}",
+                    style_text,
+                )
+            except Exception:
+                logger.exception("Topic quiz generation failed: %s", step_label)
+                failed.append(step_label)
+                continue
+
+            for question in generated or []:
+                try:
+                    question["exam"] = subj_cfg["exam"]
+                    question["subject"] = (topic or subj_cfg["label"])[:60]
+                    question["source"] = f"topicquiz-{subj}-{style}"
+                    question_id, result = add_question(question)
+
+                    if question_id and result == "added":
+                        new_ids.append(question_id)
+                        added_here += 1
+                    elif question_id and result == "duplicate":
+                        duplicate += 1
+                except Exception:
+                    logger.exception("Topic quiz question save failed")
+
+        lines.append(f"✓ {step_label}: {added_here}/{n}")
+
+        try:
+            await status.edit_text(
+                f"📝 {subject_label} quiz बन रहा है...\n"
+                + " | ".join(note)
+                + "\n\n" + "\n".join(lines[-12:])
+            )
+        except Exception:
+            pass
+
+    if not new_ids:
+        await message.reply_text(
+            "कोई नया question नहीं बन सका।\n"
+            f"Duplicate: {duplicate} | Failed steps: {len(failed)}\n"
+            "सही कारण server logs में है।"
+        )
+        return
+
+    import random as _random
+    _random.shuffle(new_ids)
+
+    title = f"{subject_label}" + (f": {topic}" if topic else "")
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=update.effective_user.id,
+        title=title[:100],
+        question_ids=new_ids,
+        exam=(cfg["exam"] if cfg else "Mix"),
+    )
+
+    if not quiz_id:
+        await message.reply_text("Questions बन गए, पर Quiz create नहीं हो सका।")
+        return
+
+    quiz_questions = get_saved_quiz_questions(quiz_id)
+
+    if not quiz_questions:
+        await message.reply_text("Quiz में questions नहीं मिले।")
+        return
+
+    session_id = create_quiz_session(
+        user_id=update.effective_user.id,
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    summary = [
+        "✅ Quiz तैयार है।",
+        "",
+        f"Subject: {subject_label}",
+        f"Questions: {len(new_ids)}",
+        f"Duplicate छोड़े गए: {duplicate}",
+        f"Quiz ID: {quiz_id}  (दोबारा: /quizid {quiz_id} retry)",
+    ]
+
+    if failed:
+        summary.append("Fail हुए भाग: " + ", ".join(sorted(set(failed))))
 
     summary += ["", "पहला question शुरू हो रहा है..."]
 
@@ -12302,6 +12926,13 @@ def build_application():
         CommandHandler(
             "rpsc",
             rpsc_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "topicquiz",
+            topicquiz_command
         )
     )
 
