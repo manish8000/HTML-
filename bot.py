@@ -5608,6 +5608,12 @@ async def advance_quiz(
             session_id
         )
 
+        await maybe_continue_auto_quiz(
+            context,
+            chat_id,
+            session_id
+        )
+
 
 async def send_scorecard(
     context,
@@ -9546,6 +9552,427 @@ async def autoquiz_command(update, context):
 
 
 # ============================================================
+# 24x7 AUTO QUIZ (SUBJECT ROTATION)
+# ============================================================
+#
+# हर chat के लिए एक state रखा जाता है:
+#   subjects       -> subject नामों की list (round-robin order)
+#   subject_index  -> अगली बार किस subject से batch बनेगा
+#   status         -> "off" | "running" | "paused"
+#   session_id     -> अभी चल रहा auto-batch का quiz session id
+#   count          -> हर batch में कितने questions
+#   admin_id       -> जिसने /startauto चलाया (stats/answer-tracking के लिए)
+#
+# Flow:
+#   /setsubjects  -> subjects सेट होते हैं
+#   /startauto    -> status="running", पहला batch शुरू
+#   हर batch खत्म होने पर advance_quiz() -> maybe_continue_auto_quiz()
+#       अगले subject का batch खुद-ब-खुद शुरू कर देता है (लूप कभी रुकता नहीं)
+#   /stopauto     -> चालू batch फ़ौरन रोककर status="paused"
+#       (अब कोई भी manual quiz normally चल सकती है)
+#   कोई भी quiz (manual हो या auto) उसी chat में खत्म होने पर, अगर status
+#       "paused" है, तो auto खुद वापस "running" होकर अगला subject शुरू कर देता है
+#   /resumeauto   -> तुरंत resume (manual quiz के खत्म होने का इंतज़ार किए बिना)
+
+AUTO_QUIZ_STATE = {}
+AUTO_QUIZ_DEFAULT_COUNT = 15
+
+
+def get_auto_state(chat_id):
+
+    state = AUTO_QUIZ_STATE.get(chat_id)
+
+    if not state:
+
+        state = {
+            "subjects": [],
+            "subject_index": 0,
+            "status": "off",
+            "session_id": None,
+            "count": AUTO_QUIZ_DEFAULT_COUNT,
+            "admin_id": None,
+        }
+
+        AUTO_QUIZ_STATE[chat_id] = state
+
+    return state
+
+
+async def run_auto_quiz_batch(context, chat_id):
+    """
+    मौजूदा subject पर AI से नया quiz batch बनाकर शुरू करता है,
+    और subject_index को अगले subject पर rotate कर देता है।
+    """
+
+    state = get_auto_state(chat_id)
+
+    if state["status"] != "running":
+        return
+
+    if not state["subjects"]:
+
+        state["status"] = "off"
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Auto Quiz रुक गया: कोई subject सेट नहीं है।\n"
+                    "पहले /setsubjects Subject1, Subject2, ... भेजें।"
+                )
+            )
+        except Exception:
+            logger.exception("Auto quiz: subjects missing notice failed")
+
+        return
+
+    if not SERPAPI_API_KEY or not ai_available():
+
+        state["status"] = "off"
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⚠️ Auto Quiz रुक गया: SERPAPI_API_KEY या "
+                    "GROQ/DEEPSEEK key configured नहीं है।"
+                )
+            )
+        except Exception:
+            logger.exception("Auto quiz: key missing notice failed")
+
+        return
+
+    topic = state["subjects"][state["subject_index"]]
+    count = state["count"]
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🔄 अगला Auto Quiz batch शुरू हो रहा है — विषय: {topic}"
+        )
+    except Exception:
+        logger.exception("Auto quiz: batch-start notice failed")
+
+    try:
+
+        context_text, sources = await asyncio.to_thread(
+            build_context_from_serpapi,
+            topic,
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Auto quiz: SerpAPI search failed for %s",
+            topic
+        )
+
+        context_text = None
+
+    questions = []
+
+    if context_text:
+
+        try:
+
+            questions = await asyncio.to_thread(
+                groq_generate_questions,
+                topic,
+                count,
+                context_text,
+                "serpapi",
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Auto quiz: AI generation failed for %s",
+                topic
+            )
+
+            questions = []
+
+    new_ids = []
+
+    for question in questions or []:
+
+        try:
+
+            question_id, status = add_question(question)
+
+            if question_id and status == "added":
+                new_ids.append(question_id)
+
+        except Exception:
+            logger.exception("Auto quiz: question save failed")
+
+    # अगले subject पर rotate करें — चाहे यह batch fail ही क्यों न हो जाए,
+    # ताकि एक खराब/empty subject पूरे 24x7 loop को न रोक दे
+    state["subject_index"] = (
+        state["subject_index"] + 1
+    ) % len(state["subjects"])
+
+    if not new_ids:
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⚠️ \"{topic}\" पर questions नहीं बन सके, "
+                    "अगले subject पर जा रहे हैं..."
+                )
+            )
+        except Exception:
+            logger.exception("Auto quiz: fail notice failed")
+
+        if state["status"] == "running":
+            await run_auto_quiz_batch(context, chat_id)
+
+        return
+
+    quiz_id = create_quiz_from_question_ids(
+        user_id=state["admin_id"],
+        title=f"Auto: {topic}"[:100],
+        question_ids=new_ids,
+    )
+
+    quiz_questions = (
+        get_saved_quiz_questions(quiz_id)
+        if quiz_id else None
+    )
+
+    if not quiz_questions:
+
+        if state["status"] == "running":
+            await run_auto_quiz_batch(context, chat_id)
+
+        return
+
+    session_id = create_quiz_session(
+        user_id=state["admin_id"],
+        questions=quiz_questions,
+        quiz_id=quiz_id,
+    )
+
+    state["session_id"] = session_id
+
+    await send_quiz_question(
+        context,
+        chat_id,
+        session_id,
+    )
+
+
+async def maybe_continue_auto_quiz(context, chat_id, ended_session_id):
+    """
+    advance_quiz() से किसी भी session के खत्म होने पर call होता है।
+
+    - अगर यही session auto-loop का हिस्सा था और status अभी भी
+      "running" है -> अगला subject batch फ़ौरन शुरू करो (loop जारी रहे)।
+    - अगर status "paused" है (यानी /stopauto के बाद कोई manual quiz
+      चल रही थी और वो अभी-अभी खत्म हुई) -> auto वापस "running" करके
+      अगला subject batch शुरू करो।
+    """
+
+    state = AUTO_QUIZ_STATE.get(chat_id)
+
+    if not state:
+        return
+
+    if (
+        state["status"] == "running"
+        and state["session_id"] == ended_session_id
+    ):
+        await run_auto_quiz_batch(context, chat_id)
+
+    elif state["status"] == "paused":
+        state["status"] = "running"
+        await run_auto_quiz_batch(context, chat_id)
+
+
+async def setsubjects_command(update, context):
+    """/setsubjects Subject1, Subject2, Subject3 ..."""
+
+    if not await require_admin(update):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/setsubjects Subject1, Subject2, Subject3\n\n"
+            "Example:\n"
+            "/setsubjects Rajasthan History, Indian Polity, "
+            "Geography, Current Affairs"
+        )
+        return
+
+    raw = " ".join(context.args)
+    subjects = [s.strip() for s in raw.split(",") if s.strip()]
+
+    if not subjects:
+        await update.message.reply_text("कोई valid subject नहीं मिला।")
+        return
+
+    chat_id = update.effective_chat.id
+    state = get_auto_state(chat_id)
+    state["subjects"] = subjects
+    state["subject_index"] = 0
+
+    await update.message.reply_text(
+        "✅ Auto Quiz subjects सेट हो गए:\n"
+        + "\n".join(f"{i+1}. {s}" for i, s in enumerate(subjects))
+        + "\n\nअब /startauto भेजकर 24x7 quiz शुरू करें।"
+    )
+
+
+async def startauto_command(update, context):
+    """/startauto [COUNT] - इस chat में 24x7 auto quiz शुरू करता है।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    state = get_auto_state(chat_id)
+
+    if not state["subjects"]:
+        await update.message.reply_text(
+            "पहले /setsubjects से subjects सेट करें।\n"
+            "Example:\n/setsubjects History, Geography, Polity"
+        )
+        return
+
+    if state["status"] == "running":
+        await update.message.reply_text("Auto Quiz पहले से चल रहा है।")
+        return
+
+    count = AUTO_QUIZ_DEFAULT_COUNT
+
+    if context.args and context.args[0].isdigit():
+        count = max(1, min(int(context.args[0]), MAX_IMPORT_QUESTIONS))
+
+    state["count"] = count
+    state["admin_id"] = update.effective_user.id
+    state["status"] = "running"
+
+    await update.message.reply_text(
+        "▶️ 24x7 Auto Quiz शुरू हो रहा है।\n"
+        f"Subjects: {', '.join(state['subjects'])}\n"
+        f"हर batch में questions: {count}\n\n"
+        "किसी भी समय रोकने के लिए /stopauto भेजें।"
+    )
+
+    await run_auto_quiz_batch(context, chat_id)
+
+
+async def stopauto_command(update, context):
+    """
+    /stopauto - चालू Auto Quiz को फ़ौरन रोकता है ताकि आप अपनी मनचाही
+    quiz चला सकें। इसके बाद कोई भी manual quiz खत्म होते ही Auto Quiz
+    अपने-आप, अगले subject से, फिर शुरू हो जाएगा।
+    """
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    state = AUTO_QUIZ_STATE.get(chat_id)
+
+    if not state or state["status"] != "running":
+        await update.message.reply_text("अभी कोई Auto Quiz नहीं चल रहा।")
+        return
+
+    session_id = state.get("session_id")
+
+    if session_id:
+
+        session = get_quiz_session(session_id)
+
+        if session:
+
+            poll_id = session.get("current_poll_id")
+
+            if poll_id:
+
+                poll_info = ACTIVE_POLLS.pop(poll_id, None)
+
+                if poll_info:
+
+                    try:
+                        await context.bot.stop_poll(
+                            chat_id=poll_info["chat_id"],
+                            message_id=poll_info["message_id"]
+                        )
+                    except Exception:
+                        pass
+
+            remove_quiz_session(session_id)
+
+    state["session_id"] = None
+    state["status"] = "paused"
+
+    await update.message.reply_text(
+        "⏸️ Auto Quiz रोक दिया गया।\n"
+        "अब अपनी quiz चलाएं (/quiz, /quizid, /rpsc, /autoquiz आदि)।\n"
+        "आपकी quiz खत्म होते ही Auto Quiz अपने-आप, अगले subject से, "
+        "फिर शुरू हो जाएगा।"
+    )
+
+
+async def resumeauto_command(update, context):
+    """/resumeauto - रुका हुआ Auto Quiz तुरंत वापस शुरू करता है।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    state = AUTO_QUIZ_STATE.get(chat_id)
+
+    if not state or not state["subjects"]:
+        await update.message.reply_text(
+            "पहले /setsubjects और /startauto चलाएं।"
+        )
+        return
+
+    if state["status"] == "running":
+        await update.message.reply_text("Auto Quiz पहले से चल रहा है।")
+        return
+
+    state["status"] = "running"
+
+    await update.message.reply_text("▶️ Auto Quiz वापस शुरू हो रहा है...")
+
+    await run_auto_quiz_batch(context, chat_id)
+
+
+async def autostatus_command(update, context):
+    """/autostatus - इस chat का Auto Quiz status दिखाता है।"""
+
+    chat_id = update.effective_chat.id
+    state = AUTO_QUIZ_STATE.get(chat_id)
+
+    if not state or not state["subjects"]:
+        await update.message.reply_text(
+            "Auto Quiz अभी तक setup नहीं हुआ।\n"
+            "/setsubjects से शुरू करें।"
+        )
+        return
+
+    status_label = {
+        "running": "▶️ चल रहा है",
+        "paused": "⏸️ रुका हुआ है (manual quiz का इंतज़ार / /resumeauto)",
+        "off": "⏹️ बंद है",
+    }.get(state["status"], state["status"])
+
+    await update.message.reply_text(
+        f"Status: {status_label}\n"
+        f"Subjects: {', '.join(state['subjects'])}\n"
+        f"अगला subject: {state['subjects'][state['subject_index']]}\n"
+        f"हर batch में questions: {state['count']}"
+    )
+
+
+# ============================================================
 # WEBSEARCH COMMAND (RAW SERPAPI RESULTS, NO QUIZ)
 # ============================================================
 
@@ -13167,6 +13594,45 @@ def build_application():
         CommandHandler(
             "resethistory",
             resethistory_command
+        )
+    )
+
+    # ========================================================
+    # 24x7 AUTO QUIZ
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "setsubjects",
+            setsubjects_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "startauto",
+            startauto_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stopauto",
+            stopauto_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "resumeauto",
+            resumeauto_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "autostatus",
+            autostatus_command
         )
     )
 
