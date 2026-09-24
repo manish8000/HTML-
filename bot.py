@@ -2528,6 +2528,60 @@ def deepseek_chat(messages, temperature=0.4, max_tokens=12000):
     return data["choices"][0]["message"].get("content") or ""
 
 
+def ai_chat_completion(messages, temperature=0.4, max_tokens=1500):
+    """
+    सामान्य AI chat helper (MCQ जनरेशन के लिए नहीं) — Groq पहले try करता है
+    (retries सहित), फेल होने पर DeepSeek fallback, plain text जवाब लौटाता है।
+    """
+
+    if not ai_available():
+        raise RuntimeError(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
+        )
+
+    content = ""
+    last_error = None
+
+    if groq_client is not None:
+        for attempt in range(max(1, GROQ_MAX_RETRIES + 1)):
+            try:
+                response = groq_client.chat.completions.create(
+                    model=GROQ_MODEL,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = response.choices[0].message.content or ""
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt >= GROQ_MAX_RETRIES:
+                    break
+                delay = GROQ_RETRY_BASE_SECONDS * (2 ** attempt)
+                time.sleep(delay)
+
+    if (
+        (last_error is not None or not content.strip() or groq_client is None)
+        and DEEPSEEK_API_KEY
+    ):
+        try:
+            content = deepseek_chat(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            last_error = None
+        except Exception as exc:
+            last_error = last_error or exc
+            content = ""
+
+    if last_error is not None and not content.strip():
+        raise last_error
+
+    return content.strip()
+
+
 # ============================================================
 # SERPAPI CLIENT STATE
 # ============================================================
@@ -9973,6 +10027,526 @@ async def autostatus_command(update, context):
 
 
 # ============================================================
+# EXAM COUNTDOWN + DAILY CURRENT AFFAIRS DIGEST (roz 8:00 AM IST)
+# ============================================================
+
+IST = timezone(timedelta(hours=5, minutes=30))
+DAILY_BROADCAST_HOUR = 8
+DAILY_BROADCAST_MINUTE = 0
+
+
+def get_exam_countdown_chats():
+
+    raw = get_setting("examcountdown_chats", "[]")
+
+    try:
+        return set(json.loads(raw))
+    except Exception:
+        return set()
+
+
+def save_exam_countdown_chats(chat_ids):
+    set_setting("examcountdown_chats", json.dumps(list(chat_ids)))
+
+
+def get_exam_countdown(chat_id):
+
+    raw = get_setting(f"examcountdown:{chat_id}", "")
+
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def save_exam_countdown(chat_id, name, date_str):
+
+    set_setting(
+        f"examcountdown:{chat_id}",
+        json.dumps({"name": name, "date": date_str}),
+    )
+
+    chats = get_exam_countdown_chats()
+    chats.add(chat_id)
+    save_exam_countdown_chats(chats)
+
+
+def clear_exam_countdown_for_chat(chat_id):
+
+    set_setting(f"examcountdown:{chat_id}", "")
+
+    chats = get_exam_countdown_chats()
+    chats.discard(chat_id)
+    save_exam_countdown_chats(chats)
+
+
+async def setexam_command(update, context):
+    """/setexam परीक्षा-नाम | YYYY-MM-DD"""
+
+    if not await require_admin(update):
+        return
+
+    raw = " ".join(context.args) if context.args else ""
+
+    if "|" not in raw:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/setexam परीक्षा-नाम | YYYY-MM-DD\n\n"
+            "Example:\n"
+            "/setexam RPSC RAS | 2026-12-15"
+        )
+        return
+
+    name_part, date_part = raw.split("|", 1)
+    name = name_part.strip()
+    date_str = date_part.strip()
+
+    if not name:
+        await update.message.reply_text("परीक्षा का नाम भी दें।")
+        return
+
+    try:
+        exam_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        await update.message.reply_text(
+            "Date गलत format में है। YYYY-MM-DD इस्तेमाल करें, जैसे 2026-12-15"
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    save_exam_countdown(chat_id, name, date_str)
+
+    days_left = (exam_date - datetime.now(IST).date()).days
+
+    await update.message.reply_text(
+        "✅ Exam Countdown सेट हो गया।\n"
+        f"परीक्षा: {name}\n"
+        f"तारीख: {date_str}\n"
+        f"अभी बाकी: {days_left} दिन\n\n"
+        "अब रोज़ सुबह 8:00 बजे reminder आएगा।\n"
+        "बंद करने के लिए /stopexam भेजें।"
+    )
+
+
+async def stopexam_command(update, context):
+    """/stopexam - इस chat का Exam Countdown बंद करता है।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    clear_exam_countdown_for_chat(chat_id)
+
+    await update.message.reply_text("⏹️ Exam Countdown बंद कर दिया गया।")
+
+
+def get_digest_chats():
+
+    raw = get_setting("digest_chats", "[]")
+
+    try:
+        return set(json.loads(raw))
+    except Exception:
+        return set()
+
+
+def save_digest_chats(chat_ids):
+    set_setting("digest_chats", json.dumps(list(chat_ids)))
+
+
+async def digeston_command(update, context):
+    """/digeston - इस chat में रोज़ 8:00 बजे Current Affairs digest चालू करता है।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    chats = get_digest_chats()
+    chats.add(chat_id)
+    save_digest_chats(chats)
+
+    await update.message.reply_text(
+        "✅ Daily Current Affairs Digest चालू हो गया।\n"
+        "रोज़ सुबह 8:00 बजे यहां current affairs summary आएगी।\n"
+        "बंद करने के लिए /digestoff भेजें।"
+    )
+
+
+async def digestoff_command(update, context):
+    """/digestoff - Daily digest बंद करता है।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    chats = get_digest_chats()
+    chats.discard(chat_id)
+    save_digest_chats(chats)
+
+    await update.message.reply_text("⏹️ Daily Digest बंद कर दिया गया।")
+
+
+async def send_exam_countdowns(application):
+
+    today = datetime.now(IST).date()
+
+    for chat_id in list(get_exam_countdown_chats()):
+
+        data = get_exam_countdown(chat_id)
+
+        if not data:
+            continue
+
+        try:
+            exam_date = datetime.strptime(
+                data["date"], "%Y-%m-%d"
+            ).date()
+        except Exception:
+            continue
+
+        days_left = (exam_date - today).days
+
+        if days_left < 0:
+
+            try:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🎉 {data['name']} की तारीख निकल चुकी है।\n"
+                        "नई तारीख सेट करने के लिए /setexam भेजें।"
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Exam countdown (expired) send failed for %s",
+                    chat_id
+                )
+
+            clear_exam_countdown_for_chat(chat_id)
+            continue
+
+        if days_left == 0:
+            text = f"🚨 आज है {data['name']}! सभी को शुभकामनाएं। 💪"
+        else:
+            text = (
+                f"🎯 {data['name']} को सिर्फ {days_left} दिन बाकी हैं।\n"
+                "तैयारी जारी रखें! 💪"
+            )
+
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text
+            )
+        except Exception:
+            logger.exception(
+                "Exam countdown send failed for %s",
+                chat_id
+            )
+
+
+async def send_daily_digest(application):
+
+    if not SERPAPI_API_KEY or not ai_available():
+        return
+
+    chats = get_digest_chats()
+
+    if not chats:
+        return
+
+    topic = "आज की प्रमुख करेंट अफेयर्स खबरें भारत"
+
+    try:
+        context_text, sources = await asyncio.to_thread(
+            build_context_from_serpapi,
+            topic,
+        )
+    except Exception:
+        logger.exception("Daily digest: SerpAPI search failed")
+        context_text = None
+
+    if not context_text:
+        return
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "आप एक करेंट अफेयर्स एडिटर हैं। दिए गए context से आज की "
+                "5-6 सबसे महत्वपूर्ण खबरें छोटे-छोटे bullet points में "
+                "हिंदी में लिखें। हर bullet एक लाइन का हो। कोई अतिरिक्त "
+                "टिप्पणी न दें।"
+            )
+        },
+        {
+            "role": "user",
+            "content": context_text[:12000]
+        }
+    ]
+
+    try:
+        summary = await asyncio.to_thread(
+            ai_chat_completion,
+            messages,
+            0.3,
+            900,
+        )
+    except Exception:
+        logger.exception("Daily digest: AI summarization failed")
+        return
+
+    if not summary:
+        return
+
+    today_str = datetime.now(IST).strftime("%d %B %Y")
+
+    text = (
+        f"📰 आज की Current Affairs — {today_str}\n\n"
+        f"{summary.strip()[:3500]}"
+    )
+
+    for chat_id in list(chats):
+
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text
+            )
+        except Exception:
+            logger.exception(
+                "Daily digest send failed for %s",
+                chat_id
+            )
+
+
+async def daily_scheduler_loop(application):
+    """
+    रोज़ सुबह 8:00 बजे (IST) Exam Countdown + Current Affairs Digest
+    भेजता है। कभी नहीं रुकता — बस बीच में /stopexam ya /digestoff से
+    किसी एक chat के लिए बंद हो सकता है।
+    """
+
+    while True:
+
+        now = datetime.now(IST)
+
+        target = now.replace(
+            hour=DAILY_BROADCAST_HOUR,
+            minute=DAILY_BROADCAST_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+
+        if now >= target:
+            target += timedelta(days=1)
+
+        wait_seconds = (target - now).total_seconds()
+
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            await send_exam_countdowns(application)
+        except Exception:
+            logger.exception(
+                "Daily scheduler: exam countdown broadcast failed"
+            )
+
+        try:
+            await send_daily_digest(application)
+        except Exception:
+            logger.exception(
+                "Daily scheduler: digest broadcast failed"
+            )
+
+        # उसी minute में दोबारा trigger होने से बचने के लिए
+        await asyncio.sleep(70)
+
+
+# ============================================================
+# AI DOUBT-SOLVER
+# ============================================================
+#
+# दो तरीकों से काम करता है:
+#   1. /doubt SAWAAL  -> हमेशा काम करता है, कहीं भी
+#   2. Bot के किसी message पर reply करके सवाल लिखना -> सिर्फ उन chats
+#      में काम करता है जहाँ admin ने /doubton से चालू किया हो, ताकि
+#      पहले से चल रहे add/edit/quiz flows से कोई टकराव न हो
+
+def get_doubt_chats():
+
+    raw = get_setting("doubt_chats", "[]")
+
+    try:
+        return set(json.loads(raw))
+    except Exception:
+        return set()
+
+
+def save_doubt_chats(chat_ids):
+    set_setting("doubt_chats", json.dumps(list(chat_ids)))
+
+
+async def doubton_command(update, context):
+    """/doubton - इस chat में reply-to-solve वाला AI Doubt-Solver चालू करता है।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    chats = get_doubt_chats()
+    chats.add(chat_id)
+    save_doubt_chats(chats)
+
+    await update.message.reply_text(
+        "✅ AI Doubt-Solver चालू हो गया।\n"
+        "अब कोई भी member bot के किसी message पर reply करके doubt "
+        "पूछ सकता है, या कहीं से भी /doubt SAWAAL भेज सकता है।"
+    )
+
+
+async def doubtoff_command(update, context):
+    """/doubtoff - reply-to-solve वाला तरीका बंद करता है (/doubt फिर भी चलेगा)।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    chats = get_doubt_chats()
+    chats.discard(chat_id)
+    save_doubt_chats(chats)
+
+    await update.message.reply_text(
+        "⏹️ Reply-to-solve बंद कर दिया गया।\n"
+        "/doubt SAWAAL कमांड फिर भी काम करती रहेगी।"
+    )
+
+
+async def _answer_doubt(update, context, question_text):
+
+    question_text = (question_text or "").strip()
+
+    if not question_text:
+        await update.message.reply_text(
+            "अपना सवाल लिखें।\n\n"
+            "Example:\n"
+            "/doubt भारत के राष्ट्रपति की न्यूनतम आयु कितनी है?"
+        )
+        return
+
+    if not ai_available():
+        await update.message.reply_text(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है, "
+            "इसलिए doubt solve नहीं हो सकता।"
+        )
+        return
+
+    thinking_message = None
+
+    try:
+        thinking_message = await update.message.reply_text(
+            "🤔 सोच रहा हूं..."
+        )
+    except Exception:
+        pass
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "आप एक भारतीय सरकारी परीक्षाओं (RPSC, REET, SSC, Railway "
+                "आदि) के विशेषज्ञ शिक्षक हैं। छात्र के सवाल का सीधा, सही "
+                "और संक्षिप्त जवाब हिंदी में दें (ज़्यादा से ज़्यादा 6-8 "
+                "पंक्तियाँ)। अगर कोई तथ्य पक्का न हो तो साफ़ बता दें कि "
+                "अनिश्चित है, गलत जानकारी न दें।"
+            )
+        },
+        {
+            "role": "user",
+            "content": question_text[:2000]
+        }
+    ]
+
+    try:
+        answer = await asyncio.to_thread(
+            ai_chat_completion,
+            messages,
+            0.3,
+            700,
+        )
+    except Exception:
+        logger.exception("AI doubt-solver failed")
+        answer = None
+
+    if thinking_message:
+        try:
+            await thinking_message.delete()
+        except Exception:
+            pass
+
+    if not answer:
+        await update.message.reply_text(
+            "माफ़ करें, अभी जवाब नहीं बन पाया। दोबारा try करें।"
+        )
+        return
+
+    await update.message.reply_text(
+        f"💡 {answer.strip()[:3500]}"
+    )
+
+
+async def doubt_command(update, context):
+    """/doubt SAWAAL - AI से सीधा doubt solve कराएं।"""
+
+    ensure_user(update.effective_user)
+
+    question_text = (
+        " ".join(context.args) if context.args else ""
+    )
+
+    await _answer_doubt(update, context, question_text)
+
+
+async def doubt_reply_handler(update, context):
+    """
+    Bot के किसी message पर reply करके पूछे गए doubt को handle करता है।
+    सिर्फ उन chats में active जहाँ /doubton चला हो, और सिर्फ तब जब
+    user किसी और pending flow (add/edit) के बीच में न हो।
+    """
+
+    message = update.effective_message
+
+    if not message or not message.text:
+        return
+
+    if not message.reply_to_message:
+        return
+
+    replied = message.reply_to_message
+
+    if not replied.from_user or replied.from_user.id != context.bot.id:
+        return
+
+    user = update.effective_user
+    user_id = user.id if user else None
+
+    if user_id and PENDING.get(user_id):
+        return
+
+    chat_id = update.effective_chat.id
+
+    if chat_id not in get_doubt_chats():
+        return
+
+    ensure_user(user)
+
+    await _answer_doubt(update, context, message.text)
+
+
+# ============================================================
 # WEBSEARCH COMMAND (RAW SERPAPI RESULTS, NO QUIZ)
 # ============================================================
 
@@ -13167,6 +13741,14 @@ async def post_init(application):
         "Clone queue worker started."
     )
 
+    application.create_task(
+        daily_scheduler_loop(application)
+    )
+
+    logger.info(
+        "Daily scheduler (exam countdown + digest) started."
+    )
+
 
 def build_application():
 
@@ -13595,6 +14177,67 @@ def build_application():
             "resethistory",
             resethistory_command
         )
+    )
+
+    # ========================================================
+    # EXAM COUNTDOWN + DAILY DIGEST + AI DOUBT-SOLVER
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "setexam",
+            setexam_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stopexam",
+            stopexam_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "digeston",
+            digeston_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "digestoff",
+            digestoff_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "doubt",
+            doubt_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "doubton",
+            doubton_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "doubtoff",
+            doubtoff_command
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.REPLY,
+            doubt_reply_handler
+        ),
+        group=2
     )
 
     # ========================================================
