@@ -53,6 +53,8 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 SERPAPI_API_KEY = os.getenv("SERPAPI_API_KEY", "").strip()
+NEWSDATA_API_KEY = os.getenv("NEWSDATA_API_KEY", "").strip()
+NEWSDATA_BASE_URL = "https://newsdata.io/api/1/news"
 
 CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
 
@@ -10248,9 +10250,74 @@ async def send_exam_countdowns(application):
             )
 
 
+def fetch_newsdata_articles(category="top", country="in", language="hi", max_results=10):
+    """
+    NewsData.io से आज की ताज़ा खबरें लाता है। Free tier पर सिर्फ title +
+    description भरोसे के साथ मिलते हैं (content अक्सर truncated होता है),
+    जो summarization के लिए काफ़ी है। Key configured न हो या fail हो
+    जाए तो None लौटाता है (caller SerpAPI पर fallback करेगा)।
+    """
+
+    if not NEWSDATA_API_KEY:
+        return None
+
+    params = {
+        "apikey": NEWSDATA_API_KEY,
+        "country": country,
+        "language": language,
+        "category": category,
+    }
+
+    try:
+        response = requests.get(
+            NEWSDATA_BASE_URL,
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        logger.exception("NewsData.io fetch failed")
+        return None
+
+    if data.get("status") != "success":
+        logger.warning(
+            "NewsData.io returned non-success status: %s",
+            data.get("status")
+        )
+        return None
+
+    results = data.get("results") or []
+
+    if not results:
+        return None
+
+    lines = []
+
+    for item in results[:max_results]:
+
+        title = (item.get("title") or "").strip()
+        description = (item.get("description") or "").strip()
+
+        if not title:
+            continue
+
+        entry = f"- {title}"
+
+        if description:
+            entry += f": {description}"
+
+        lines.append(entry)
+
+    if not lines:
+        return None
+
+    return "\n".join(lines)
+
+
 async def send_daily_digest(application):
 
-    if not SERPAPI_API_KEY or not ai_available():
+    if not ai_available():
         return
 
     chats = get_digest_chats()
@@ -10258,18 +10325,45 @@ async def send_daily_digest(application):
     if not chats:
         return
 
-    topic = "आज की प्रमुख करेंट अफेयर्स खबरें भारत"
+    context_text = None
+    source_label = None
 
-    try:
-        context_text, sources = await asyncio.to_thread(
-            build_context_from_serpapi,
-            topic,
-        )
-    except Exception:
-        logger.exception("Daily digest: SerpAPI search failed")
-        context_text = None
+    if NEWSDATA_API_KEY:
+
+        try:
+            context_text = await asyncio.to_thread(
+                fetch_newsdata_articles
+            )
+
+            if context_text:
+                source_label = "newsdata"
+
+        except Exception:
+            logger.exception("Daily digest: NewsData.io failed")
+            context_text = None
+
+    if not context_text and SERPAPI_API_KEY:
+
+        topic = "आज की प्रमुख करेंट अफेयर्स खबरें भारत"
+
+        try:
+            context_text, sources = await asyncio.to_thread(
+                build_context_from_serpapi,
+                topic,
+            )
+
+            if context_text:
+                source_label = "serpapi"
+
+        except Exception:
+            logger.exception("Daily digest: SerpAPI fallback failed")
+            context_text = None
 
     if not context_text:
+        logger.warning(
+            "Daily digest: कोई news source उपलब्ध नहीं "
+            "(NewsData.io + SerpAPI दोनों fail/missing)"
+        )
         return
 
     messages = [
