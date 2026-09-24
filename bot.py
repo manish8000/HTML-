@@ -6981,6 +6981,57 @@ async def require_admin(
     return True
 
 
+async def can_generate_quiz(update, context):
+    """
+    Quiz-generation commands (generate, autoquiz, newsquiz, rpsc, आदि)
+    के लिए permission check:
+
+    - Global admin (ADMIN_IDS) हमेशा allowed है, कहीं भी।
+    - Group/supergroup में, अगर bot को उस group में admin बनाया गया है,
+      तो उस group के सभी members ये commands इस्तेमाल कर सकते हैं।
+    - Private chat (bot से DM) में सिर्फ global admin allowed है,
+      ताकि कोई भी random user DM से AI/API quota खर्च न कर सके।
+    """
+
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if not user:
+        return False
+
+    if is_admin(user.id):
+        return True
+
+    if chat and chat.type in ("group", "supergroup"):
+
+        try:
+            bot_member = await context.bot.get_chat_member(
+                chat.id,
+                context.bot.id,
+            )
+        except Exception:
+            logger.exception(
+                "can_generate_quiz: get_chat_member failed for chat %s",
+                chat.id if chat else None
+            )
+            bot_member = None
+
+        if bot_member is not None and bot_member.status in (
+            "administrator",
+            "creator",
+        ):
+            return True
+
+    if update.effective_message:
+
+        await update.effective_message.reply_text(
+            "यह command तभी काम करेगी जब bot को इस group में "
+            "admin बनाया गया हो।"
+        )
+
+    return False
+
+
 # ============================================================
 # /ADD
 # ============================================================
@@ -7900,7 +7951,7 @@ async def queue_command(
 
 async def generate_command(update, context):
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     if not context.args:
@@ -8129,7 +8180,7 @@ async def _run_text_quiz(update, context, text, label="Text"):
 
 async def textquiz_command(update, context):
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     message = update.message
@@ -8292,7 +8343,7 @@ async def photo_handler(update, context):
 async def photoquiz_command(update, context):
     """किसी फ़ोटो पर reply करके /photoquiz भेजें।"""
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     message = update.message
@@ -8450,7 +8501,7 @@ def _allocate_counts(rows, total):
 async def syllabustest_command(update, context):
     """/syllabustest EXAM [COUNT]: syllabus के अनुसार sources से पूरा test."""
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     message = update.message
@@ -8721,7 +8772,7 @@ def _parse_rpsc_args(args):
 async def rpsc_command(update, context):
     """/rpsc [TYPE] [COUNT] TOPIC: RPSC पैटर्न के प्रश्न बनाकर quiz शुरू करें."""
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     message = update.message
@@ -9187,7 +9238,7 @@ def _topicquiz_context(cfg, topic, domains, source_pages):
 async def topicquiz_command(update, context):
     """/topicquiz [SUBJECT] [COUNT] [STYLE] [TOPIC]"""
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     message = update.message
@@ -9404,7 +9455,7 @@ async def autoquiz_command(update, context):
       5. Quiz session तुरंत शुरू हो जाता है (पहला question auto-भेजा जाता है)।
     """
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     if not SERPAPI_API_KEY:
@@ -10732,7 +10783,7 @@ async def newsquiz_command(update, context):
     quiz बनाकर तुरंत शुरू कर देता है।
     """
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     if not SERPAPI_API_KEY:
@@ -10949,7 +11000,7 @@ async def wikiquiz_command(update, context):
     polity, geography, science वगैरह के लिए ज़्यादा भरोसेमंद)।
     """
 
-    if not await require_admin(update):
+    if not await can_generate_quiz(update, context):
         return
 
     if not ai_available():
