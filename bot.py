@@ -64,6 +64,9 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
+COINS_PER_CORRECT_ANSWER = 10
+TITLE_UNLOCK_COST = 100
+
 PORT = int(os.getenv("PORT", "8000"))
 
 DB_PATH = os.getenv(
@@ -793,6 +796,14 @@ def init_db():
         _add_column_if_missing(
             conn, "questions", "difficulty",
             "TEXT DEFAULT 'medium'"
+        )
+        _add_column_if_missing(
+            conn, "users", "coins",
+            "INTEGER DEFAULT 0"
+        )
+        _add_column_if_missing(
+            conn, "users", "custom_title",
+            "TEXT DEFAULT ''"
         )
 
 
@@ -1849,6 +1860,120 @@ def get_stats(
 # ============================================================
 # UPDATE USER STATS
 # ============================================================
+
+def award_coins(
+    user_id,
+    amount
+):
+
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return False
+
+    if not amount:
+        return False
+
+    with DB_LOCK:
+
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO users
+            (id, created_at, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, utcnow(), utcnow())
+        )
+
+        conn.execute(
+            """
+            UPDATE users
+            SET coins = COALESCE(coins, 0) + ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (amount, utcnow(), user_id)
+        )
+
+        conn.commit()
+        conn.close()
+
+    return True
+
+
+def get_coins(user_id):
+
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return 0
+
+    conn = db()
+
+    try:
+        row = conn.execute(
+            "SELECT coins FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row and row["coins"] is not None:
+        return row["coins"]
+
+    return 0
+
+
+def get_custom_title(user_id):
+
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return ""
+
+    conn = db()
+
+    try:
+        row = conn.execute(
+            "SELECT custom_title FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row and row["custom_title"]:
+        return row["custom_title"]
+
+    return ""
+
+
+def set_custom_title(user_id, title):
+
+    try:
+        user_id = int(user_id)
+    except Exception:
+        return False
+
+    with DB_LOCK:
+
+        conn = db()
+
+        conn.execute(
+            """
+            UPDATE users
+            SET custom_title = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (title, utcnow(), user_id)
+        )
+
+        conn.commit()
+        conn.close()
+
+    return True
+
 
 def update_user_stats(
     user_id,
@@ -6039,6 +6164,11 @@ async def poll_answer_handler(
             session["user_id"],
             correct=True,
             score_delta=1
+        )
+
+        award_coins(
+            session["user_id"],
+            COINS_PER_CORRECT_ANSWER
         )
 
         result_text = "🎉 सही उत्तर! बधाई हो।"
@@ -10507,6 +10637,22 @@ async def daily_scheduler_loop(application):
                 "Daily scheduler: digest broadcast failed"
             )
 
+        try:
+            await send_qotd(application)
+        except Exception:
+            logger.exception(
+                "Daily scheduler: QOTD broadcast failed"
+            )
+
+        if datetime.now(IST).weekday() == 6:  # रविवार
+
+            try:
+                await send_weekly_admin_report(application)
+            except Exception:
+                logger.exception(
+                    "Daily scheduler: weekly admin report failed"
+                )
+
         # उसी minute में दोबारा trigger होने से बचने के लिए
         await asyncio.sleep(70)
 
@@ -10689,6 +10835,510 @@ async def doubt_reply_handler(update, context):
     ensure_user(user)
 
     await _answer_doubt(update, context, message.text)
+
+
+# ============================================================
+# COINS + CUSTOM TITLE
+# ============================================================
+
+async def mycoins_command(update, context):
+    """/mycoins - अपने coins और title देखें।"""
+
+    user = update.effective_user
+    ensure_user(user)
+
+    coins = get_coins(user.id)
+    title = get_custom_title(user.id)
+
+    text = f"🪙 आपके coins: {coins}\n"
+
+    if title:
+        text += f"🏷️ आपका title: {title}\n"
+
+    text += (
+        f"\nहर सही जवाब पर {COINS_PER_CORRECT_ANSWER} coins मिलते हैं।\n"
+        f"{TITLE_UNLOCK_COST} coins से /settitle से अपना custom title "
+        "सेट करें।"
+    )
+
+    await update.message.reply_text(text)
+
+
+async def settitle_command(update, context):
+    """/settitle YOUR-TITLE - coins खर्च करके custom title सेट करें।"""
+
+    user = update.effective_user
+    ensure_user(user)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/settitle आपका-title\n\n"
+            f"खर्च: {TITLE_UNLOCK_COST} coins\n\n"
+            "Example:\n"
+            "/settitle Polity King 👑"
+        )
+        return
+
+    new_title = " ".join(context.args).strip()[:40]
+
+    if not new_title:
+        await update.message.reply_text("Title खाली नहीं हो सकता।")
+        return
+
+    coins = get_coins(user.id)
+
+    if coins < TITLE_UNLOCK_COST:
+        await update.message.reply_text(
+            f"Title set करने के लिए {TITLE_UNLOCK_COST} coins चाहिए।\n"
+            f"आपके पास अभी {coins} coins हैं। "
+            "सही जवाब देकर coins कमाएं। (/mycoins)"
+        )
+        return
+
+    award_coins(user.id, -TITLE_UNLOCK_COST)
+    set_custom_title(user.id, new_title)
+
+    await update.message.reply_text(
+        f"✅ आपका title सेट हो गया: {new_title}\n"
+        f"{TITLE_UNLOCK_COST} coins काट लिए गए। "
+        f"बचे हुए coins: {get_coins(user.id)}"
+    )
+
+
+# ============================================================
+# MNEMONIC GENERATOR (/yaad)
+# ============================================================
+
+async def yaad_command(update, context):
+    """/yaad TOPIC - AI से hindi mnemonic/याद रखने की ट्रिक बनवाएं।"""
+
+    ensure_user(update.effective_user)
+
+    topic = " ".join(context.args) if context.args else ""
+
+    if not topic:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/yaad टॉपिक/तथ्य\n\n"
+            "Example:\n"
+            "/yaad राजस्थान के संभाग और जिलों का क्रम"
+        )
+        return
+
+    if not ai_available():
+        await update.message.reply_text(
+            "GROQ_API_KEY या DEEPSEEK_API_KEY configured नहीं है।"
+        )
+        return
+
+    thinking_message = None
+
+    try:
+        thinking_message = await update.message.reply_text(
+            "🧠 Mnemonic बना रहा हूं..."
+        )
+    except Exception:
+        pass
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "आप एक creative शिक्षक हैं जो भारतीय सरकारी परीक्षाओं "
+                "के लिए हिंदी में आसान याद रखने की ट्रिक (mnemonic) "
+                "बनाते हैं। छोटा, मज़ेदार और याद रहने लायक जवाब दें "
+                "(ज़्यादा से ज़्यादा 5-6 लाइनों में)।"
+            )
+        },
+        {
+            "role": "user",
+            "content": topic[:500]
+        }
+    ]
+
+    try:
+        result = await asyncio.to_thread(
+            ai_chat_completion,
+            messages,
+            0.7,
+            400,
+        )
+    except Exception:
+        logger.exception("yaad_command failed")
+        result = None
+
+    if thinking_message:
+        try:
+            await thinking_message.delete()
+        except Exception:
+            pass
+
+    if not result:
+        await update.message.reply_text(
+            "Mnemonic नहीं बन पाया, दोबारा try करें।"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🧠 याद रखने की ट्रिक:\n\n{result.strip()[:2000]}"
+    )
+
+
+# ============================================================
+# PERSONALIZED STUDY PLAN (/studyplan)
+# ============================================================
+
+async def studyplan_command(update, context):
+    """/studyplan - अपने weak topics के आधार पर 7-दिन का revision plan पाएं।"""
+
+    user = update.effective_user
+    ensure_user(user)
+
+    rows = get_weak_topics(user.id, limit=5)
+
+    if not rows:
+        await update.message.reply_text(
+            "अभी तक कोई weak topic नहीं मिला, plan बनाने के लिए "
+            "थोड़े और quiz खेलिए।"
+        )
+        return
+
+    topics_text = ", ".join(
+        f"{r['subject']} ({r['wrong_count']} गलत)" for r in rows
+    )
+
+    if not ai_available():
+
+        lines = ["📅 7-दिन Study Plan (weak topics पर आधारित):\n"]
+
+        for i, r in enumerate(rows, 1):
+            lines.append(
+                f"दिन {i}: {r['subject']} revise करें "
+                f"({r['wrong_count']} गलत जवाब)"
+            )
+
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    thinking_message = None
+
+    try:
+        thinking_message = await update.message.reply_text(
+            "📅 Study plan बना रहा हूं..."
+        )
+    except Exception:
+        pass
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "आप एक भारतीय सरकारी परीक्षाओं के मेंटर हैं। दिए गए "
+                "weak topics के आधार पर एक practical 7-दिन का revision "
+                "plan हिंदी में बनाएं ('दिन 1:', 'दिन 2:' ... format "
+                "में), हर दिन सिर्फ 1-2 लाइन में क्या करना है वो लिखें। "
+                "छोटा और actionable रखें।"
+            )
+        },
+        {
+            "role": "user",
+            "content": f"मेरे weak topics: {topics_text}"
+        }
+    ]
+
+    try:
+        plan = await asyncio.to_thread(
+            ai_chat_completion,
+            messages,
+            0.4,
+            700,
+        )
+    except Exception:
+        logger.exception("studyplan_command failed")
+        plan = None
+
+    if thinking_message:
+        try:
+            await thinking_message.delete()
+        except Exception:
+            pass
+
+    if not plan:
+        await update.message.reply_text(
+            "Plan नहीं बन पाया, दोबारा try करें।"
+        )
+        return
+
+    await update.message.reply_text(
+        f"📅 आपका 7-दिन Study Plan:\n\n{plan.strip()[:3000]}"
+    )
+
+
+# ============================================================
+# WELCOME MESSAGE (नए group member के लिए)
+# ============================================================
+
+async def welcome_new_member(update, context):
+
+    message = update.effective_message
+
+    if not message or not message.new_chat_members:
+        return
+
+    bot_id = context.bot.id
+
+    for member in message.new_chat_members:
+
+        if member.id == bot_id:
+
+            try:
+                await message.reply_text(
+                    "👋 नमस्ते! मैं यहां quiz बनाने और doubts solve "
+                    "करने में मदद करूंगा।\n\n"
+                    "शुरू करने के लिए:\n"
+                    "/quiz - तुरंत quiz खेलें\n"
+                    "/doubt SAWAAL - कोई भी doubt पूछें\n"
+                    "/help - सभी commands देखें"
+                )
+            except Exception:
+                logger.exception("Bot welcome message failed")
+
+            continue
+
+        name = member.first_name or member.username or "Member"
+
+        try:
+            await message.reply_text(
+                f"🎉 स्वागत है, {name}!\n\n"
+                "यहां quiz खेलने के लिए /quiz भेजें, या कोई doubt हो तो "
+                "/doubt SAWAAL लिखकर पूछें। शुभकामनाएं! 💪"
+            )
+        except Exception:
+            logger.exception(
+                "Welcome message failed for new member"
+            )
+
+
+# ============================================================
+# QUESTION OF THE DAY (casual, non-scored — फिर भी Telegram
+# native quiz-poll जैसा दिखता है, पर हमारे leaderboard में count
+# नहीं होता, सिर्फ मज़े के लिए)
+# ============================================================
+
+def get_qotd_chats():
+
+    raw = get_setting("qotd_chats", "[]")
+
+    try:
+        return set(json.loads(raw))
+    except Exception:
+        return set()
+
+
+def save_qotd_chats(chat_ids):
+    set_setting("qotd_chats", json.dumps(list(chat_ids)))
+
+
+async def qotdon_command(update, context):
+    """/qotdon - रोज़ 8:00 बजे एक casual 'Question of the Day' चालू करें।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    chats = get_qotd_chats()
+    chats.add(chat_id)
+    save_qotd_chats(chats)
+
+    await update.message.reply_text(
+        "✅ Question of the Day चालू हो गया।\n"
+        "रोज़ सुबह 8:00 बजे एक मज़ेदार GK सवाल आएगा (कोई scoring नहीं, "
+        "बस मज़े के लिए)।\n"
+        "बंद करने के लिए /qotdoff भेजें।"
+    )
+
+
+async def qotdoff_command(update, context):
+    """/qotdoff - Question of the Day बंद करें।"""
+
+    if not await require_admin(update):
+        return
+
+    chat_id = update.effective_chat.id
+    chats = get_qotd_chats()
+    chats.discard(chat_id)
+    save_qotd_chats(chats)
+
+    await update.message.reply_text("⏹️ Question of the Day बंद कर दिया गया।")
+
+
+ANSWER_LETTER_TO_INDEX = {"A": 0, "B": 1, "C": 2, "D": 3}
+
+
+async def send_qotd(application):
+
+    if not ai_available():
+        return
+
+    chats = get_qotd_chats()
+
+    if not chats:
+        return
+
+    topic = (
+        "कोई भी एक रोचक सामान्य ज्ञान (General Knowledge) तथ्य — "
+        "विज्ञान, इतिहास, भूगोल, खेल, कला में से कोई भी एक विषय चुनें"
+    )
+
+    try:
+        questions = await asyncio.to_thread(
+            groq_generate_questions,
+            topic,
+            1,
+            "",
+            "qotd",
+        )
+    except Exception:
+        logger.exception("QOTD: generation failed")
+        return
+
+    if not questions:
+        return
+
+    q = questions[0]
+
+    options = [
+        (q.get("option_a") or "")[:95],
+        (q.get("option_b") or "")[:95],
+        (q.get("option_c") or "")[:95],
+        (q.get("option_d") or "")[:95],
+    ]
+
+    if not all(options):
+        return
+
+    answer_letter = str(q.get("answer") or "A").strip().upper()
+    correct_index = ANSWER_LETTER_TO_INDEX.get(answer_letter, 0)
+
+    question_text = f"🌟 आज का सवाल: {q.get('question', '')}"[:290]
+    explanation = (q.get("explanation") or "")[:190]
+
+    for chat_id in list(chats):
+
+        try:
+            await application.bot.send_poll(
+                chat_id=chat_id,
+                question=question_text,
+                options=options,
+                type="quiz",
+                correct_option_id=correct_index,
+                is_anonymous=True,
+                explanation=explanation or None,
+            )
+        except Exception:
+            logger.exception(
+                "QOTD send failed for %s",
+                chat_id
+            )
+
+
+# ============================================================
+# WEEKLY ADMIN REPORT (हर रविवार, admins को DM)
+# ============================================================
+
+async def send_weekly_admin_report(application):
+
+    if not ADMIN_IDS:
+        return
+
+    week_ago = (
+        datetime.now(timezone.utc) - timedelta(days=7)
+    ).isoformat()
+
+    conn = db()
+
+    try:
+
+        total_users = conn.execute(
+            "SELECT COUNT(*) AS c FROM users"
+        ).fetchone()["c"]
+
+        active_users = conn.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) AS c
+            FROM quiz_history
+            WHERE answered_at >= ?
+            """,
+            (week_ago,)
+        ).fetchone()["c"]
+
+        answers_this_week = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM quiz_history
+            WHERE answered_at >= ?
+            """,
+            (week_ago,)
+        ).fetchone()["c"]
+
+        weak_subjects = conn.execute(
+            """
+            SELECT
+                COALESCE(q.subject, 'General') AS subject,
+                COUNT(*) AS wrong_count
+            FROM quiz_history h
+            JOIN questions q
+                ON q.id = h.question_id
+            WHERE h.correct = 0
+            AND h.answered_at >= ?
+            GROUP BY subject
+            ORDER BY wrong_count DESC
+            LIMIT 3
+            """,
+            (week_ago,)
+        ).fetchall()
+
+        total_questions = conn.execute(
+            "SELECT COUNT(*) AS c FROM questions WHERE active = 1"
+        ).fetchone()["c"]
+
+    finally:
+        conn.close()
+
+    lines = [
+        "📊 Weekly Admin Report",
+        "",
+        f"कुल registered users: {total_users}",
+        f"इस हफ्ते active users: {active_users}",
+        f"इस हफ्ते answered questions: {answers_this_week}",
+        f"Question bank size: {total_questions}",
+        "",
+        "सबसे कमज़ोर topics (इस हफ्ते):",
+    ]
+
+    if weak_subjects:
+        for r in weak_subjects:
+            lines.append(
+                f"- {r['subject']}: {r['wrong_count']} गलत जवाब"
+            )
+    else:
+        lines.append("- कोई data नहीं")
+
+    text = "\n".join(lines)
+
+    for admin_id in ADMIN_IDS:
+
+        try:
+            await application.bot.send_message(
+                chat_id=admin_id,
+                text=text
+            )
+        except Exception:
+            logger.exception(
+                "Weekly admin report send failed for %s",
+                admin_id
+            )
 
 
 # ============================================================
@@ -14321,6 +14971,59 @@ def build_application():
         CommandHandler(
             "resethistory",
             resethistory_command
+        )
+    )
+
+    # ========================================================
+    # COINS, MNEMONIC, STUDY PLAN, QOTD, WELCOME
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler(
+            "mycoins",
+            mycoins_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "settitle",
+            settitle_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "yaad",
+            yaad_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "studyplan",
+            studyplan_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "qotdon",
+            qotdon_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "qotdoff",
+            qotdoff_command
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            welcome_new_member
         )
     )
 
